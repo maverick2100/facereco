@@ -1,0 +1,13 @@
+# Python 3.10 - 3.12 (arm64 native) recommended.
+coremltools>=8.3
+numpy>=1.24
+opencv-python-headless>=4.9
+Pillow>=10.0
+PyYAML>=6.0
+python-dotenv>=1.0
+psutil>=5.9
+pytest>=7.4
+
+# GStreamer Python bindings are installed separately (see README):
+#   brew install gstreamer pygobject3      (then create the venv with --system-site-packages)
+#   or: brew install gstreamer gobject-introspection cairo pkg-config && pip install PyGObject

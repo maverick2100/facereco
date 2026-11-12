@@ -1,0 +1,106 @@
+# Camera definitions.
+#
+# Tips for low CPU on a Mac mini M4 with 20 cameras:
+#  * Use each camera's SUB-STREAM (e.g. 640x360 / 1280x720 H.264). Decoding 20 main
+#    streams (4K/1080p) wastes the media engine and memory bandwidth.
+#  * `fps` is what reaches Python; GStreamer drops everything else after the
+#    hardware decoder. 3-5 fps is plenty for face recognition at entrances.
+#  * width/height should match the stream resolution (scaling costs CPU).
+#  * Use test://ball or file:///path/video.mp4 as url for testing.
+
+defaults:
+  codec: h264          # h264 | h265 | auto
+  decoder: vtdec       # VideoToolbox hardware decoder
+  width: 1280
+  height: 720
+  fps: 4
+  latency_ms: 200
+  transport: tcp
+  priority: 1.0
+  enabled: true
+
+cameras:
+  - camera_id: cam01
+    name: Camera 01
+    location: Zone 01
+    url: rtsp://admin:password@192.168.1.101:554/Streaming/Channels/102
+  - camera_id: cam02
+    name: Camera 02
+    location: Zone 02
+    url: rtsp://admin:password@192.168.1.102:554/Streaming/Channels/102
+  - camera_id: cam03
+    name: Camera 03
+    location: Zone 03
+    url: rtsp://admin:password@192.168.1.103:554/Streaming/Channels/102
+  - camera_id: cam04
+    name: Camera 04
+    location: Zone 04
+    url: rtsp://admin:password@192.168.1.104:554/Streaming/Channels/102
+  - camera_id: cam05
+    name: Camera 05
+    location: Zone 05
+    url: rtsp://admin:password@192.168.1.105:554/Streaming/Channels/102
+  - camera_id: cam06
+    name: Camera 06
+    location: Zone 06
+    url: rtsp://admin:password@192.168.1.106:554/Streaming/Channels/102
+  - camera_id: cam07
+    name: Camera 07
+    location: Zone 07
+    url: rtsp://admin:password@192.168.1.107:554/Streaming/Channels/102
+  - camera_id: cam08
+    name: Camera 08
+    location: Zone 08
+    url: rtsp://admin:password@192.168.1.108:554/Streaming/Channels/102
+  - camera_id: cam09
+    name: Camera 09
+    location: Zone 09
+    url: rtsp://admin:password@192.168.1.109:554/Streaming/Channels/102
+  - camera_id: cam10
+    name: Camera 10
+    location: Zone 10
+    url: rtsp://admin:password@192.168.1.110:554/Streaming/Channels/102
+  - camera_id: cam11
+    name: Camera 11
+    location: Zone 11
+    url: rtsp://admin:password@192.168.1.111:554/Streaming/Channels/102
+  - camera_id: cam12
+    name: Camera 12
+    location: Zone 12
+    url: rtsp://admin:password@192.168.1.112:554/Streaming/Channels/102
+  - camera_id: cam13
+    name: Camera 13
+    location: Zone 13
+    url: rtsp://admin:password@192.168.1.113:554/Streaming/Channels/102
+  - camera_id: cam14
+    name: Camera 14
+    location: Zone 14
+    url: rtsp://admin:password@192.168.1.114:554/Streaming/Channels/102
+  - camera_id: cam15
+    name: Camera 15
+    location: Zone 15
+    url: rtsp://admin:password@192.168.1.115:554/Streaming/Channels/102
+  - camera_id: cam16
+    name: Camera 16
+    location: Zone 16
+    url: rtsp://admin:password@192.168.1.116:554/Streaming/Channels/102
+  - camera_id: cam17
+    name: Camera 17
+    location: Zone 17
+    url: rtsp://admin:password@192.168.1.117:554/Streaming/Channels/102
+  - camera_id: cam18
+    name: Camera 18
+    location: Zone 18
+    url: rtsp://admin:password@192.168.1.118:554/Streaming/Channels/102
+  - camera_id: cam19
+    name: Camera 19
+    location: Zone 19
+    url: rtsp://admin:password@192.168.1.119:554/Streaming/Channels/102
+  - camera_id: cam20
+    name: Camera 20
+    location: Zone 20
+    url: rtsp://admin:password@192.168.1.120:554/Streaming/Channels/102
+    # Example of per-camera overrides:
+    # roi: [200, 100, 1080, 700]
+    # priority: 2.0
+    # fps: 6
