@@ -9,5 +9,5 @@ psutil>=5.9
 pytest>=7.4
 
 # GStreamer Python bindings are installed separately (see README):
-#   brew install gstreamer pygobject3      (then create the venv with --system-site-packages)
-#   or: brew install gstreamer gobject-introspection cairo pkg-config && pip install PyGObject
+#   brew install gstreamer gobject-introspection pkg-config cairo
+#   pip install PyGObject

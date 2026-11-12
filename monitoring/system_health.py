@@ -24,6 +24,20 @@ from monitoring.performance import PerformanceTracker
 log = logging.getLogger(__name__)
 
 
+class _FastHTTPServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind() calls socket.getfqdn(), which can block for ~30 s on
+    macOS while reverse DNS times out. Skip it - the name is never used."""
+
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        import socketserver
+
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name, self.server_port = str(host), port
+
+
 class SystemHealth:
     def __init__(self, settings: MonitoringSettings, perf: PerformanceTracker, cameras: CameraHealthRegistry,
                  extra: Optional[Dict[str, Callable[[], dict]]] = None) -> None:
@@ -136,7 +150,7 @@ class SystemHealth:
                 pass
 
         try:
-            self._server = ThreadingHTTPServer((self.settings.health_host, self.settings.health_port), Handler)
+            self._server = _FastHTTPServer((self.settings.health_host, self.settings.health_port), Handler)
         except OSError as exc:
             log.warning("Health endpoint disabled: %s", exc)
             return

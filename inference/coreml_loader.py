@@ -66,11 +66,20 @@ def parse_feature(feature: Any) -> FeatureSpec:
 
 
 def _fingerprint(path: Path, extra: str) -> str:
+    """Cache key for a model package.
+
+    coremltools rewrites Manifest.json (new mtime) every time it opens an .mlpackage, so
+    small files are hashed by content; big weight files by size + mtime (never rewritten).
+    """
     h = hashlib.sha1(extra.encode())
     files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
     for f in files:
         st = f.stat()
-        h.update(f"{f.relative_to(path.parent)}:{st.st_size}:{st.st_mtime_ns}".encode())
+        h.update(str(f.relative_to(path.parent)).encode())
+        if st.st_size <= 4 * 1024 * 1024:
+            h.update(f.read_bytes())
+        else:
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
     return h.hexdigest()[:16]
 
 
