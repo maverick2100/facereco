@@ -190,6 +190,37 @@ class StorageSettings:
     event_batch_size: int = 100
     event_queue_size: int = 5000
     retention_days: int = 90
+    # PostgreSQL: set database_url OR pg_host (+ pg_user / pg_password / pg_database). Empty = SQLite (db_path).
+    database_url: str = ""
+    pg_host: str = ""
+    pg_port: int = 5432
+    pg_user: str = ""
+    pg_password: str = ""
+    pg_database: str = ""
+    pg_sslmode: str = ""             # disable | prefer | require | verify-full ...
+    pg_pool_min: int = 1
+    pg_pool_max: int = 10
+    pg_connect_timeout_s: float = 15.0
+
+    @property
+    def backend(self) -> str:
+        return "postgres" if (self.database_url or self.pg_host) else "sqlite"
+
+    def postgres_conninfo(self) -> str:
+        """psycopg connection string, or "" when SQLite is configured.
+
+        Separate FR_PG_* values override the matching part of FR_DATABASE_URL, so a password with
+        special characters can be given as FR_PG_PASSWORD without URL-encoding it."""
+        if self.backend != "postgres":
+            return ""
+        from psycopg.conninfo import make_conninfo
+
+        overrides = {k: v for k, v in {
+            "host": self.pg_host, "port": str(self.pg_port) if self.pg_host else "",
+            "user": self.pg_user, "password": self.pg_password, "dbname": self.pg_database,
+            "sslmode": self.pg_sslmode,
+        }.items() if v}
+        return make_conninfo(self.database_url, **overrides)
 
 
 @dataclass
@@ -316,6 +347,16 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         event_batch_size=_env("FR_EVENT_BATCH", 100),
         event_queue_size=_env("FR_EVENT_QUEUE", 5000),
         retention_days=_env("FR_RETENTION_DAYS", 90),
+        database_url=str(_env("FR_DATABASE_URL", "")),
+        pg_host=str(_env("FR_PG_HOST", "")),
+        pg_port=_env("FR_PG_PORT", 5432),
+        pg_user=str(_env("FR_PG_USER", "")),
+        pg_password=os.environ.get("FR_PG_PASSWORD", ""),   # not stripped: spaces may be part of it
+        pg_database=str(_env("FR_PG_DATABASE", "")),
+        pg_sslmode=str(_env("FR_PG_SSLMODE", "")),
+        pg_pool_min=_env("FR_PG_POOL_MIN", 1),
+        pg_pool_max=_env("FR_PG_POOL_MAX", 10),
+        pg_connect_timeout_s=_env("FR_PG_CONNECT_TIMEOUT_S", 15.0),
     )
     mon = MonitoringSettings(
         health_host=_env("FR_HEALTH_HOST", "127.0.0.1"),
@@ -351,6 +392,8 @@ def _validate(s: Settings) -> None:
         raise ValueError("FR_PERSON_FLUSH_S must be > 0")
     if s.detection.batch_size < 1 or s.recognition.batch_size < 1 or s.person.batch_size < 1:
         raise ValueError("batch sizes must be >= 1")
+    if s.storage.database_url and not s.storage.database_url.startswith(("postgres://", "postgresql://")):
+        raise ValueError("FR_DATABASE_URL must start with postgresql:// (leave it empty to use SQLite)")
     for c in s.cameras:
         if c.fps <= 0:
             raise ValueError(f"camera {c.camera_id}: fps must be > 0")

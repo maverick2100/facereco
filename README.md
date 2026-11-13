@@ -67,6 +67,34 @@ cameras:
 
 Passwords may contain special characters (`@ # / ?`). They're handled automatically and are never written to the database.
 
+### 3b. Database: SQLite or PostgreSQL
+
+By default everything is stored in a local SQLite file (`data/face_recognition.db`), and nothing needs to be set up. To use PostgreSQL instead, put your server's address and credentials in **`.env`**. Use either one URL:
+
+```bash
+FR_DATABASE_URL=postgresql://facereco:secret@192.168.1.50:5432/facereco
+```
+
+or separate fields. Separate fields need no URL-encoding, so they're easier when the password has special characters:
+
+```bash
+FR_PG_HOST=192.168.1.50
+FR_PG_PORT=5432
+FR_PG_USER=facereco
+FR_PG_PASSWORD=p@ss:w/rd#1
+FR_PG_DATABASE=facereco
+FR_PG_SSLMODE=prefer        # require / verify-full for a server outside your network
+```
+
+If both are set, the `FR_PG_*` fields override the matching part of the URL. The database must already exist, and the tables are created on first start. Then check the connection:
+
+```bash
+python main.py db-check                       # prints OK + row counts, or the connection error
+python scripts/migrate_sqlite_to_postgres.py  # optional: copy existing SQLite data (people, faces, events)
+```
+
+`.env` is in `.gitignore`, so your credentials stay out of git, and the password is masked in every log line.
+
 ### 4. Add the models
 
 ```
@@ -94,8 +122,8 @@ python scripts/benchmark_scrfd.py                       # ANE vs CPU speed and C
 python scripts/benchmark_arcface.py
 python scripts/test_gstreamer.py --cameras cam01,cam02  # cameras stream (no models needed)
 python scripts/test_gstreamer.py --url rtsp://user:pass@ip/stream   # test a single URL
-python scripts/init_database.py                         # creates data/face_recognition.db
-pytest -q                                               # unit tests (49)
+python scripts/init_database.py                         # creates the tables (SQLite file or PostgreSQL)
+pytest -q                                               # unit tests (56; PostgreSQL ones run when FR_TEST_DATABASE_URL is set)
 ```
 
 ### 6. Enrol people
@@ -120,9 +148,11 @@ Photos taken by the real cameras give the best results. You can re-run `enroll` 
 ```bash
 python main.py run                      # all enabled cameras
 python main.py run --cameras cam01,cam02
+python main.py run --show               # also open a window with live boxes + names
+python main.py run --show cam01,cam02   # window shows only these cameras
 ```
 
-Stop with **Ctrl+C**, which shuts down cleanly. While it runs:
+Stop with **Ctrl+C**, which shuts down cleanly. With `--show`, you can also press **q** or **Esc** in the window. The window shows every camera in a grid, with known faces in green (name + similarity), unknown faces in red, faces still being checked in grey, people in blue and the `roi` in yellow. It shows the frames that were actually analysed, so it updates at each camera's `fps`. The window needs `opencv-python`; the `opencv-python-headless` build can't open windows on some installs. While it runs:
 
 | Where | What |
 |---|---|
@@ -241,7 +271,7 @@ inference/              Core ML loader + cache, ANE config, SCRFD / ArcFace engi
 processing/             letterbox / normalization, alignment, quality gate, NMS
 recognition/            embedding gallery, matcher, identity hot-reload, de-dup + track cache
 person_detection/       YOLOv7 engine, person tracker, per-interval counter, person-count service
-database/               SQLite (WAL) + repositories
+database/               SQLite (WAL) or PostgreSQL + repositories
 services/               enrolment, real-time recognition pipeline, event writer / CSV export
 monitoring/             CPU, memory, ANE, performance counters, health HTTP endpoint
 scripts/                tests, benchmarks, DB init, ONNX -> Core ML converter

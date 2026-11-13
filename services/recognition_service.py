@@ -19,6 +19,7 @@ import numpy as np
 
 from config.settings import CameraConfig, DetectionSettings, RecognitionSettings
 from constants import UNKNOWN_PERSON_ID
+from services.live_view import KNOWN, PENDING, REJECTED, UNKNOWN, FaceBox, LiveView
 from inference.inference_manager import InferenceManager
 from monitoring.performance import PerformanceTracker
 from processing.face_alignment import norm_crop
@@ -52,7 +53,8 @@ class RecognitionService:
     def __init__(self, inference: InferenceManager, frames: FrameScheduler, identity: IdentityManager,
                  matcher: FaceMatcher, duplicates: DuplicateFilter, tracks: TrackCache, events: EventService,
                  cameras: List[CameraConfig], det_cfg: DetectionSettings, rec_cfg: RecognitionSettings,
-                 perf: Optional[PerformanceTracker] = None, save_snapshots: bool = False) -> None:
+                 perf: Optional[PerformanceTracker] = None, save_snapshots: bool = False,
+                 live: Optional[LiveView] = None) -> None:
         self.inference = inference
         self.frames = frames
         self.identity = identity
@@ -65,6 +67,7 @@ class RecognitionService:
         self.rec_cfg = rec_cfg
         self.perf = perf or PerformanceTracker()
         self.save_snapshots = save_snapshots
+        self.live = live
         self.quality_cfg = QualityConfig(
             min_face_size=det_cfg.min_face_size,
             blur_threshold=rec_cfg.blur_threshold,
@@ -113,7 +116,11 @@ class RecognitionService:
                     log.exception("[%s] post-detection failed", frame.camera_id)
 
     def _handle_detections(self, frame: Frame, dets: np.ndarray, kps: np.ndarray, now: float) -> None:
+        live = self.live is not None
+        boxes: List[FaceBox] = []
         if dets.shape[0] == 0:
+            if live:
+                self.live.publish_faces(frame.camera_id, frame.image, frame.timestamp, boxes)
             return
         cam = self.cameras.get(frame.camera_id)
         faces = filter_faces(faces_from_detections(dets, kps), min_size=self.det_cfg.min_face_size,
@@ -124,16 +131,26 @@ class RecognitionService:
             if hit is not None:
                 self.duplicates.touch(frame.camera_id, hit[0], now)
                 self.perf.incr("faces_track_reused")
+                if live:
+                    pid, sim = hit
+                    boxes.append(FaceBox(face.bbox_int(), self.identity.name_of(pid),
+                                         UNKNOWN if pid == UNKNOWN_PERSON_ID else KNOWN, sim))
                 continue
             crop = norm_crop(frame.image, face.kps)
             q = assess_quality(face, crop, self.quality_cfg)
             if not q.passed:
                 self.perf.incr(f"faces_rejected_{q.reason}")
+                if live:
+                    boxes.append(FaceBox(face.bbox_int(), q.reason, REJECTED))
                 continue
             snap = crop_with_margin(frame.image, face.bbox, 0.4) if self.save_snapshots else None
             task = FaceTask(frame.camera_id, frame.frame_id, frame.timestamp, face, crop, q.score, snap)
             if not self.rec_queue.put(task):
                 self.perf.incr("faces_dropped_backpressure")
+            if live:
+                boxes.append(FaceBox(face.bbox_int(), "", PENDING))
+        if live:
+            self.live.publish_faces(frame.camera_id, frame.image, frame.timestamp, boxes)
 
     # ------------------------------------------------------------------ recognition
     def _recognition_loop(self) -> None:

@@ -1,0 +1,113 @@
+"""Repository queries on every database backend.
+
+SQLite always runs. PostgreSQL runs when FR_TEST_DATABASE_URL points at a scratch database
+(its tables are dropped and recreated), e.g.
+
+    docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=pw postgres:16-alpine
+    FR_TEST_DATABASE_URL=postgresql://postgres:pw@localhost:55432/postgres pytest tests/test_backends.py
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config.settings import CameraConfig, StorageSettings  # noqa: E402
+from database.camera_repository import CameraRepository  # noqa: E402
+from database.connection import Database, mask_dsn  # noqa: E402
+from database.embedding_repository import EmbeddingRepository  # noqa: E402
+from database.event_repository import EventRepository  # noqa: E402
+from database.person_count_repository import PersonCountRepository  # noqa: E402
+from database.person_repository import PersonRepository  # noqa: E402
+from database.schema import init_schema  # noqa: E402
+
+PG_URL = os.environ.get("FR_TEST_DATABASE_URL", "")
+TABLES = ["person_counts", "events", "embeddings", "persons", "cameras", "schema_version"]
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def db(request, tmp_path):
+    if request.param == "sqlite":
+        d = Database(tmp_path / "t.db")
+    else:
+        if not PG_URL:
+            pytest.skip("set FR_TEST_DATABASE_URL to test PostgreSQL")
+        from database.connection import PostgresDatabase
+
+        d = PostgresDatabase(PG_URL, max_size=4)
+        d.executescript("DROP TABLE IF EXISTS " + ", ".join(TABLES) + " CASCADE")
+    init_schema(d)
+    init_schema(d)  # idempotent
+    yield d
+    d.close()
+
+
+def test_repositories_roundtrip(db):
+    cams = CameraRepository(db)
+    cams.sync([CameraConfig(camera_id="c1", name="Door", url="rtsp://admin:secret@10.0.0.1/s")])
+    cams.sync([CameraConfig(camera_id="c1", name="Front door", url="rtsp://admin:secret@10.0.0.1/s")])
+    assert cams.get("c1")["name"] == "Front door" and "secret" not in cams.get("c1")["url_masked"]
+
+    persons, emb = PersonRepository(db), EmbeddingRepository(db)
+    a = persons.get_or_create("Alice")
+    b = persons.create("Bob", external_id="E2", metadata={"team": "x"})
+    assert a != b and persons.get_or_create("Alice") == a
+    assert persons.get(b)["metadata"] == {"team": "x"}
+
+    v = np.random.rand(512).astype(np.float32)
+    eid = emb.add(a, v, source="a.jpg")
+    assert eid > 0
+    emb.add_many([(b, v * 2, 0.9, "b.jpg")])
+    ids, vecs = emb.load_all()
+    assert sorted(ids.tolist()) == sorted([a, b])
+    np.testing.assert_allclose(vecs[ids.tolist().index(a)], v)
+    assert emb.has_source(a, "a.jpg")
+
+    now = time.time()
+    events = EventRepository(db)
+    events.insert_many([
+        ("c1", a, "Alice", 0.8123456, 0.9, 0.7, [1, 2, 3, 4], None, now - 10),
+        ("c1", None, "unknown", 0.2, 0.8, 0.6, [5, 6, 7, 8], None, now - 5),
+        ("c1", a, "Alice", 0.85, 0.9, 0.7, [1, 2, 3, 4], None, now - 1),
+    ])
+    rows = events.query(camera_id="c1")
+    assert [r["label"] for r in rows] == ["Alice", "unknown", "Alice"]
+    assert rows[0]["camera_name"] == "Front door"
+    assert abs(rows[0]["ts"] - (now - 1)) < 1e-3          # full timestamp precision
+    assert events.count() == 3 and len(events.query(known_only=True)) == 2
+
+    counts = PersonCountRepository(db)
+    counts.insert_many([("c1", now - 120, now - 60, 100, 2, 0, 3, 1.5, 4, now - 60),
+                        ("c1", now - 60, now, 100, 1, 0, 2, 1.0, 2, now)])
+    t = counts.totals()
+    assert t[0]["total_persons"] == 6 and t[0]["peak_count"] == 3 and t[0]["camera_name"] == "Front door"
+
+    assert events.delete_older_than(now - 3) == 2
+    assert counts.delete_older_than(now - 30) == 1
+    assert persons.delete(a) and emb.count_for(a) == 0
+    assert events.query()[0]["person_id"] is None           # ON DELETE SET NULL
+
+
+def test_storage_settings_conninfo():
+    pytest.importorskip("psycopg")
+    assert StorageSettings().backend == "sqlite" and StorageSettings().postgres_conninfo() == ""
+    s = StorageSettings(database_url="postgresql://u:old@db.local:5432/fr", pg_password="p@ss:w/rd #1")
+    info = s.postgres_conninfo()
+    from psycopg.conninfo import conninfo_to_dict
+
+    d = conninfo_to_dict(info)
+    assert d["password"] == "p@ss:w/rd #1" and d["host"] == "db.local" and d["dbname"] == "fr"
+    s = StorageSettings(pg_host="10.0.0.5", pg_user="fr", pg_password="x", pg_database="faces", pg_sslmode="require")
+    d = conninfo_to_dict(s.postgres_conninfo())
+    assert d == {"host": "10.0.0.5", "port": "5432", "user": "fr", "password": "x", "dbname": "faces",
+                 "sslmode": "require"}
+
+
+def test_mask_dsn():
+    assert mask_dsn("postgresql://u:secret@h:5432/db") == "postgresql://u:***@h:5432/db"
+    assert "secret" not in mask_dsn("host=h user=u password=secret dbname=db")
+    assert mask_dsn("postgresql://h/db") == "postgresql://h/db"

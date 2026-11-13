@@ -23,11 +23,10 @@ class PersonRepository:
     def create(self, name: str, external_id: Optional[str] = None,
                metadata: Optional[Dict[str, Any]] = None) -> int:
         now = time.time()
-        cur = self.db.execute(
+        return self.db.insert(
             "INSERT INTO persons(name, external_id, metadata, active, created_at, updated_at) VALUES (?,?,?,1,?,?)",
             (name, external_id, json.dumps(metadata or {}), now, now),
         )
-        return int(cur.lastrowid)
 
     def get(self, person_id: int) -> Optional[dict]:
         return self._row(self.db.fetchone("SELECT * FROM persons WHERE id = ?", (person_id,)))

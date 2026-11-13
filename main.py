@@ -13,6 +13,9 @@ Usage:
     python main.py export --since 2026-11-13 # CSV into data/exports/
     python main.py counts --since 2026-11-13 # person totals per camera (--csv for all rows)
     python main.py info                      # model + environment info
+    python main.py run --show                # same, plus a window with live boxes + names (q to quit)
+    python main.py run --show cam01,cam02    # window shows only these cameras
+    python main.py db-check                  # test the database connection (SQLite or PostgreSQL)
 """
 from __future__ import annotations
 
@@ -43,7 +46,7 @@ cv2.setUseOptimized(True)
 from config.settings import Settings, load_settings  # noqa: E402
 from constants import ENROLLMENT_DIR, EXPORTS_DIR  # noqa: E402
 from database.camera_repository import CameraRepository  # noqa: E402
-from database.connection import Database  # noqa: E402
+from database.connection import open_database  # noqa: E402
 from database.embedding_repository import EmbeddingRepository  # noqa: E402
 from database.event_repository import EventRepository  # noqa: E402
 from database.person_count_repository import PersonCountRepository  # noqa: E402
@@ -62,6 +65,7 @@ from recognition.identity_manager import IdentityManager  # noqa: E402
 from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
 from services.enrollment_service import EnrollmentService  # noqa: E402
 from services.event_service import EventService  # noqa: E402
+from services.live_view import LiveView  # noqa: E402
 from services.recognition_service import RecognitionService  # noqa: E402
 from utils.logger import setup_logging  # noqa: E402
 from utils.time_utils import iso, parse_datetime  # noqa: E402
@@ -72,14 +76,15 @@ log = logging.getLogger("main")
 class FaceRecognitionApp:
     """Composes and runs the full system."""
 
-    def __init__(self, settings: Settings, cameras=None) -> None:
+    def __init__(self, settings: Settings, cameras=None, show: Optional[List[str]] = None) -> None:
         self.settings = settings
         self.cameras = list(cameras) if cameras is not None else settings.enabled_cameras
         self.face_cameras = [c for c in self.cameras if c.runs_face]
         self.person_cameras = [c for c in self.cameras if c.runs_person]
         self.perf = PerformanceTracker()
-        self.db = Database(settings.storage.db_path)
+        self.db = open_database(settings.storage)
         init_schema(self.db)
+        log.info("Database: %s", self.db.description)
         self.camera_repo = CameraRepository(self.db)
         self.person_repo = PersonRepository(self.db)
         self.embedding_repo = EmbeddingRepository(self.db)
@@ -101,6 +106,11 @@ class FaceRecognitionApp:
         self.recognition: Optional[RecognitionService] = None
         self.person_service: Optional[PersonCountService] = None
         self.system_health: Optional[SystemHealth] = None
+        # --show: on-screen view (None = off, [] = all cameras, else these camera ids)
+        self.live: Optional[LiveView] = None
+        if show is not None:
+            shown = [c for c in self.cameras if not show or c.camera_id in show]
+            self.live = LiveView({c.camera_id: c.name for c in shown}, {c.camera_id: c.roi for c in shown})
         self._stop = threading.Event()
 
     def _make_ingestion(self):
@@ -132,6 +142,7 @@ class FaceRecognitionApp:
             self.person_service = PersonCountService(
                 load_yolo(s.models, s.person), self.person_scheduler, self.person_count_repo,
                 self.person_cameras, s.person, self.perf, retention_days=s.storage.retention_days,
+                live=self.live,
             )
             self.person_service.warmup(s.models.warmup_iterations)
 
@@ -153,6 +164,7 @@ class FaceRecognitionApp:
             self.recognition = RecognitionService(
                 self.inference, self.scheduler, self.identity, matcher, duplicates, tracks, self.events,
                 self.face_cameras, s.detection, s.recognition, self.perf, s.storage.save_snapshots,
+                live=self.live,
             )
             self.recognition.start()
         if self.person_service is not None:
@@ -189,10 +201,15 @@ class FaceRecognitionApp:
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         self.start()
         try:
+            if self.live is not None:
+                self.live.run_window(self._stop, self._camera_status)  # blocks until q / Esc / Ctrl+C
             while not self._stop.wait(1.0):
                 pass
         finally:
             self.stop()
+
+    def _camera_status(self) -> Dict[str, str]:
+        return {h["camera_id"]: f'{h["status"]} {h["fps"]:.1f} fps' for h in self.health_registry.snapshot()}
 
     def stop(self) -> None:
         log.info("Shutting down...")
@@ -209,7 +226,7 @@ class FaceRecognitionApp:
 
 # ---------------------------------------------------------------------- commands
 def _repos(settings: Settings):
-    db = Database(settings.storage.db_path)
+    db = open_database(settings.storage)
     init_schema(db)
     return db, PersonRepository(db), EmbeddingRepository(db), EventRepository(db)
 
@@ -219,7 +236,14 @@ def cmd_run(settings: Settings, args) -> int:
     if args.cameras:
         wanted = set(args.cameras.split(","))
         cams = [c for c in settings.cameras if c.camera_id in wanted]
-    FaceRecognitionApp(settings, cams).run_forever()
+    show = None
+    if args.show is not None:
+        show = [c for c in args.show.split(",") if c]
+        unknown = set(show) - {c.camera_id for c in cams}
+        if unknown:
+            print(f"--show: unknown or not running camera(s): {', '.join(sorted(unknown))}")
+            return 2
+    FaceRecognitionApp(settings, cams, show).run_forever()
     return 0
 
 
@@ -268,7 +292,7 @@ def cmd_export(settings: Settings, args) -> int:
 
 
 def cmd_counts(settings: Settings, args) -> int:
-    db = Database(settings.storage.db_path)
+    db = open_database(settings.storage)
     init_schema(db)
     repo = PersonCountRepository(db)
     since, until = parse_datetime(args.since), parse_datetime(args.until)
@@ -307,6 +331,20 @@ def cmd_info(settings: Settings, args) -> int:
     return 0
 
 
+def cmd_db_check(settings: Settings, args) -> int:
+    try:
+        db = open_database(settings.storage)
+        init_schema(db)
+        counts = {t: db.fetchone(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in ("persons", "embeddings", "cameras")}
+    except Exception as exc:
+        print(f"FAILED: {exc}")
+        return 1
+    print(f"OK  {db.description}")
+    print(f"    persons={counts['persons']} embeddings={counts['embeddings']} cameras={counts['cameras']}")
+    db.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env", help="path to .env file")
@@ -315,6 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="run real-time recognition")
     r.add_argument("--cameras", help="comma-separated camera ids (default: all enabled)")
+    r.add_argument("--show", nargs="?", const="", metavar="CAMS",
+                   help="open a window with live detections (optionally only these comma-separated cameras)")
 
     e = sub.add_parser("enroll", help="enrol faces")
     e.add_argument("--dir", default=str(ENROLLMENT_DIR), help="folder with one sub-folder per person")
@@ -343,6 +383,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", nargs="?", const="", help="export rows to CSV (optional output path)")
 
     sub.add_parser("info", help="show model/environment info")
+
+    sub.add_parser("db-check", help="test the database connection and create tables")
     return p
 
 
@@ -354,9 +396,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     commands = {
         None: cmd_run, "run": cmd_run, "enroll": cmd_enroll, "persons": cmd_persons,
         "delete-person": cmd_delete_person, "export": cmd_export, "counts": cmd_counts, "info": cmd_info,
+        "db-check": cmd_db_check,
     }
     if args.command is None:
         args.cameras = None
+        args.show = None
     return commands[args.command](settings, args)
 
 

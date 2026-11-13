@@ -24,12 +24,12 @@ class EmbeddingRepository:
     def add(self, person_id: int, vector: np.ndarray, model: str = "arcface", quality: float = 0.0,
             source: Optional[str] = None) -> int:
         v = np.asarray(vector, dtype=np.float32).reshape(-1)
-        cur = self.db.execute(
+        new_id = self.db.insert(
             "INSERT INTO embeddings(person_id, vector, dim, model, quality, source, created_at) VALUES (?,?,?,?,?,?,?)",
             (person_id, to_blob(v), int(v.size), model, float(quality), source, time.time()),
         )
         self.db.execute("UPDATE persons SET updated_at = ? WHERE id = ?", (time.time(), person_id))
-        return int(cur.lastrowid)
+        return new_id
 
     def add_many(self, rows: Iterable[Tuple[int, np.ndarray, float, Optional[str]]], model: str = "arcface") -> int:
         now = time.time()

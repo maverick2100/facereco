@@ -53,7 +53,7 @@ class PersonCountRepository:
                "MAX(p.max_count) AS peak_count, SUM(p.frames) AS frames, "
                "MIN(p.period_start) AS first_ts, MAX(p.period_end) AS last_ts "
                "FROM person_counts p LEFT JOIN cameras c ON c.id = p.camera_id" + where +
-               " GROUP BY p.camera_id ORDER BY p.camera_id")
+               " GROUP BY p.camera_id, c.name ORDER BY p.camera_id")
         return [dict(r) for r in self.db.fetchall(sql, params)]
 
     def delete_older_than(self, ts: float) -> int:

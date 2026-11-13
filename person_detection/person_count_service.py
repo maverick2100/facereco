@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 from config.settings import CameraConfig, ModelSettings, PersonSettings
 from constants import MODEL_CACHE_DIR
+from services.live_view import LiveView
 from database.person_count_repository import PersonCountRepository
 from inference.coreml_loader import CoreMLModel
 from monitoring.performance import PerformanceTracker
@@ -36,7 +37,8 @@ def load_yolo(models: ModelSettings, person: PersonSettings) -> YOLOv7Engine:
 class PersonCountService:
     def __init__(self, engine: YOLOv7Engine, frames: FrameScheduler, repo: PersonCountRepository,
                  cameras: List[CameraConfig], settings: PersonSettings,
-                 perf: Optional[PerformanceTracker] = None, retention_days: int = 0) -> None:
+                 perf: Optional[PerformanceTracker] = None, retention_days: int = 0,
+                 live: Optional[LiveView] = None) -> None:
         self.engine = engine
         self.frames = frames
         self.repo = repo
@@ -44,6 +46,7 @@ class PersonCountService:
         self.settings = settings
         self.perf = perf or PerformanceTracker()
         self.retention_days = retention_days
+        self.live = live
         self._last_retention = 0.0
         self.counter = PersonCounter(self.cameras, settings.flush_interval_s, settings.track_iou,
                                      settings.track_max_age_s, settings.track_min_hits)
@@ -105,6 +108,8 @@ class PersonCountService:
                 new = self.counter.update(frame.camera_id, dets, frame.timestamp, frame.mono_ts)
                 if new:
                     self.perf.incr("persons_new", new)
+                if self.live is not None:
+                    self.live.publish_persons(frame.camera_id, frame.image, frame.timestamp, dets)
 
     def _write(self, records: List[CountRecord]) -> None:
         if not records:
