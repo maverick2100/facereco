@@ -118,6 +118,7 @@ The converter applies the ANE optimizations described in [Making sure the models
 
 ```bash
 python scripts/test_coreml.py --image group_photo.jpg   # models load, faces detected, annotated image saved
+python scripts/check_ane.py                             # per model: % of layers on ANE / CPU / GPU, and why
 python scripts/benchmark_scrfd.py                       # ANE vs CPU speed and CPU cost
 python scripts/benchmark_arcface.py
 python scripts/test_gstreamer.py --cameras cam01,cam02  # cameras stream (no models needed)
