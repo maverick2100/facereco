@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_camera_ts ON events(camera_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_person_ts ON events(person_id, ts);
+
+-- One row per camera per interval (FR_PERSON_FLUSH_S), appended by person_detection/.
+CREATE TABLE IF NOT EXISTS person_counts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id     TEXT NOT NULL,
+    period_start  REAL NOT NULL,
+    period_end    REAL NOT NULL,
+    frames        INTEGER NOT NULL,   -- frames analysed in the interval
+    current_count INTEGER NOT NULL,   -- people in the last analysed frame
+    min_count     INTEGER NOT NULL,
+    max_count     INTEGER NOT NULL,   -- peak occupancy in the interval
+    avg_count     REAL NOT NULL,
+    new_persons   INTEGER NOT NULL,   -- distinct people that appeared (tracked) in the interval
+    ts            REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_person_counts_ts ON person_counts(ts);
+CREATE INDEX IF NOT EXISTS idx_person_counts_camera_ts ON person_counts(camera_id, ts);
 """
 
 

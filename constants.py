@@ -16,7 +16,13 @@ SNAPSHOTS_DIR = EXPORTS_DIR / "snapshots"
 
 DEFAULT_SCRFD_PATH = MODELS_DIR / "scrfd.mlpackage"
 DEFAULT_ARCFACE_PATH = MODELS_DIR / "arcface.mlpackage"
+DEFAULT_YOLO_PATH = MODELS_DIR / "yolov7.mlpackage"
 DEFAULT_DB_PATH = DATA_DIR / "face_recognition.db"
+
+# --------------------------------------------------------------------------- camera tasks
+TASK_FACE = "face"        # SCRFD + ArcFace recognition
+TASK_PERSON = "person"    # YOLOv7 person detection + counting
+CAMERA_TASKS = (TASK_FACE, TASK_PERSON)
 
 # --------------------------------------------------------------------------- SCRFD
 SCRFD_DEFAULT_INPUT = (640, 640)  # (width, height) used if the model spec has no fixed size
@@ -42,9 +48,20 @@ ARCFACE_DST = np.array(
     dtype=np.float32,
 )
 
+# --------------------------------------------------------------------------- YOLOv7 (person)
+YOLO_DEFAULT_INPUT = (640, 640)
+YOLO_PAD_VALUE = 114
+COCO_PERSON_CLASS_ID = 0
+# Default YOLOv7 anchors (pixels) per stride - only used for raw (un-decoded) head outputs.
+YOLOV7_ANCHORS = {
+    8: [(12, 16), (19, 36), (40, 28)],
+    16: [(36, 75), (76, 55), (72, 146)],
+    32: [(142, 110), (192, 243), (459, 401)],
+}
+
 # --------------------------------------------------------------------------- misc
 UNKNOWN_PERSON_ID = -1
 UNKNOWN_LABEL = "unknown"
 EVENT_LOGGER_NAME = "events"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2

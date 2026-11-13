@@ -53,8 +53,17 @@ cameras:
     width: 1280       # should match the stream resolution
     height: 720
     # codec: h265     # for HEVC cameras (default h264; "auto" also works)
-    # roi: [200, 100, 1080, 700]   # only look for faces inside this box
+    # roi: [200, 100, 1080, 700]   # only look for faces / people inside this box
+    tasks: [face]     # face | person | [face, person]  (default: face)
 ```
+
+**Choosing face recognition vs person counting per camera:** `tasks` decides what runs on each camera. Each stream is decoded once, even when a camera runs both tasks. To change it for every camera at once, set it under `defaults:`.
+
+| `tasks` | Runs | Writes to |
+|---|---|---|
+| `[face]` | SCRFD + ArcFace recognition | `events` |
+| `[person]` | YOLOv7 person detection + counting | `person_counts` |
+| `[face, person]` | both | both |
 
 Passwords may contain special characters (`@ # / ?`). They're handled automatically and are never written to the database.
 
@@ -63,7 +72,10 @@ Passwords may contain special characters (`@ # / ?`). They're handled automatica
 ```
 models/scrfd.mlpackage
 models/arcface.mlpackage
+models/yolov7.mlpackage     # only needed if any camera has tasks: [person]
 ```
+
+The YOLOv7 engine ([person_detection/yolo_engine.py](person_detection/yolo_engine.py)) works out the output layout from the tensor shapes. It handles decoded `(1, N, 85)` output (`export.py --grid`), raw `(1, 3, H, W, 85)` heads, `--end2end` NMS output `(N, 7)`, and Core ML NMS pipelines (`coordinates` / `confidence`). It logs the layout it detected at start-up. For a model with array input, pixels are divided by `FR_PERSON_INPUT_STD` (255). For a model with image input, the `1/255` scale must be built into the model. If your model wasn't trained on COCO, set `FR_PERSON_NUM_CLASSES` and `FR_PERSON_CLASS_ID`.
 
 **4b. Optional: convert from InsightFace ONNX** (e.g. `buffalo_l`: `det_10g.onnx` + `w600k_r50.onnx`). Use a separate venv, because torch is large:
 
@@ -83,7 +95,7 @@ python scripts/benchmark_arcface.py
 python scripts/test_gstreamer.py --cameras cam01,cam02  # cameras stream (no models needed)
 python scripts/test_gstreamer.py --url rtsp://user:pass@ip/stream   # test a single URL
 python scripts/init_database.py                         # creates data/face_recognition.db
-pytest -q                                               # unit tests (35)
+pytest -q                                               # unit tests (49)
 ```
 
 ### 6. Enrol people
@@ -116,7 +128,7 @@ Stop with **Ctrl+C**, which shuts down cleanly. While it runs:
 |---|---|
 | console / `logs/face_recognition.log` | a status line every 30 s (cameras, fps, ms per frame, CPU, memory) |
 | `logs/events.log` | one JSON line per recognition |
-| `data/face_recognition.db` | SQLite: persons, embeddings, events |
+| `data/face_recognition.db` | SQLite: persons, embeddings, events, person_counts |
 | `http://127.0.0.1:8085/health` | short status (`/metrics` = everything, `/cameras` = per camera) |
 | `data/exports/snapshots/` | face snapshots, if `FR_SAVE_SNAPSHOTS=true` |
 
@@ -127,9 +139,13 @@ python main.py export --since 2026-11-13 --until 2026-11-14   # CSV into data/ex
 python main.py export --camera cam01 --known-only --out today.csv
 python main.py enroll --name "Alice" --images a.jpg b.jpg [--external-id E123] [--replace]
 python main.py delete-person 3
+python main.py counts --since 2026-11-13                       # people per camera: total distinct + peak
+python main.py counts --camera cam05 --csv                     # every person_counts row -> data/exports/
 python main.py info                                            # model + environment info
 sudo .venv/bin/python main.py run    # also logs ANE power (mW) via powermetrics
 ```
+
+**Person counting:** cameras with `tasks: [person]` append one row per camera to `person_counts` every `FR_PERSON_FLUSH_S` (60 s by default). Each row holds `current_count` (people in the last frame), `min_count`, `max_count` and `avg_count` (occupancy over the interval), `new_persons` (distinct people who appeared, from a light IoU tracker, so someone standing still is counted once) and `frames`. "Total persons detected" is `SUM(new_persons)`. Live totals are also available at `/metrics` under `person_counts`.
 
 To run it as a service, start it with `launchd` or `tmux`. Running it as root is only needed for the ANE power readings.
 
@@ -224,6 +240,7 @@ scheduler/              per-camera latest-frame queues, fair scheduler, micro-ba
 inference/              Core ML loader + cache, ANE config, SCRFD / ArcFace engines, profiler
 processing/             letterbox / normalization, alignment, quality gate, NMS
 recognition/            embedding gallery, matcher, identity hot-reload, de-dup + track cache
+person_detection/       YOLOv7 engine, person tracker, per-interval counter, person-count service
 database/               SQLite (WAL) + repositories
 services/               enrolment, real-time recognition pipeline, event writer / CSV export
 monitoring/             CPU, memory, ANE, performance counters, health HTTP endpoint

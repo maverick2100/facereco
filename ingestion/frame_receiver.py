@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 import cv2
 import numpy as np
@@ -23,17 +23,28 @@ log = logging.getLogger(__name__)
 
 
 class FrameReceiver:
-    """Callable sink: image -> Frame -> CameraQueue (+ health accounting)."""
+    """Callable sink: image -> Frame -> CameraQueue(s) (+ health accounting).
 
-    def __init__(self, camera_id: str, queue: CameraQueue, health: Optional[CameraHealth] = None) -> None:
+    A camera running several tasks (face + person) is decoded once; the same read-only
+    frame is handed to each task's queue.
+    """
+
+    def __init__(self, camera_id: str, queue: Union[CameraQueue, Sequence[CameraQueue]],
+                 health: Optional[CameraHealth] = None) -> None:
         self.camera_id = camera_id
-        self.queue = queue
+        self.queues: List[CameraQueue] = [queue] if isinstance(queue, CameraQueue) else list(queue)
         self.health = health
         self._frame_id = 0
 
+    @property
+    def queue(self) -> CameraQueue:
+        return self.queues[0]
+
     def __call__(self, image: np.ndarray) -> None:
         self._frame_id += 1
-        self.queue.put(Frame(self.camera_id, self._frame_id, image, time.time(), time.monotonic()))
+        frame = Frame(self.camera_id, self._frame_id, image, time.time(), time.monotonic())
+        for q in self.queues:
+            q.put(frame)
         if self.health is not None:
             self.health.on_frame()
 

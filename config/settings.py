@@ -12,13 +12,18 @@ import yaml
 from constants import (
     ARCFACE_INPUT_MEAN,
     ARCFACE_INPUT_STD,
+    CAMERA_TASKS,
+    COCO_PERSON_CLASS_ID,
     CONFIG_DIR,
     DEFAULT_ARCFACE_PATH,
     DEFAULT_DB_PATH,
     DEFAULT_SCRFD_PATH,
+    DEFAULT_YOLO_PATH,
     PROJECT_ROOT,
     SCRFD_INPUT_MEAN,
     SCRFD_INPUT_STD,
+    TASK_FACE,
+    TASK_PERSON,
 )
 
 try:
@@ -66,6 +71,15 @@ class CameraConfig:
     transport: str = "tcp"       # tcp | udp
     priority: float = 1.0        # >1 = scheduled more aggressively
     roi: Optional[List[int]] = None  # [x1, y1, x2, y2] in delivered resolution
+    tasks: List[str] = field(default_factory=lambda: [TASK_FACE])  # face | person | both
+
+    @property
+    def runs_face(self) -> bool:
+        return TASK_FACE in self.tasks
+
+    @property
+    def runs_person(self) -> bool:
+        return TASK_PERSON in self.tasks
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> "CameraConfig":
@@ -80,6 +94,15 @@ class CameraConfig:
             raise ValueError(f"camera entry needs camera_id and url: {data}")
         kwargs["camera_id"] = str(kwargs["camera_id"])
         kwargs.setdefault("name", kwargs["camera_id"])
+        tasks = kwargs.get("tasks", [TASK_FACE])
+        if isinstance(tasks, str):
+            tasks = [t.strip() for t in tasks.split(",")]
+        tasks = [str(t).strip().lower() for t in tasks if str(t).strip()]
+        bad = [t for t in tasks if t not in CAMERA_TASKS]
+        if bad or not tasks:
+            raise ValueError(f"camera {kwargs['camera_id']}: tasks must be a non-empty subset of "
+                             f"{list(CAMERA_TASKS)}, got {kwargs.get('tasks')!r}")
+        kwargs["tasks"] = list(dict.fromkeys(tasks))
         cam = cls(**kwargs)
         if cam.roi is not None and len(cam.roi) != 4:
             raise ValueError(f"camera {cam.camera_id}: roi must be [x1, y1, x2, y2]")
@@ -98,6 +121,25 @@ class ModelSettings:
     arcface_input_mean: float = ARCFACE_INPUT_MEAN
     arcface_input_std: float = ARCFACE_INPUT_STD
     warmup_iterations: int = 3
+    yolo_path: Path = DEFAULT_YOLO_PATH
+
+
+@dataclass
+class PersonSettings:
+    """YOLOv7 person detection + counting (cameras with `tasks: [person]`)."""
+    conf_threshold: float = 0.4      # objectness * person-class score
+    nms_threshold: float = 0.45
+    class_id: int = COCO_PERSON_CLASS_ID
+    num_classes: int = 80            # classes in your YOLOv7 model (COCO = 80)
+    input_std: float = 255.0         # MultiArray inputs only: pixel / std (YOLO expects 0..1)
+    min_box_height: int = 30         # px in delivered resolution; ignore tiny/far detections
+    batch_size: int = 4
+    max_wait_ms: float = 8.0
+    max_fps: float = 0.0             # per-camera cap for person detection (0 = camera fps)
+    track_iou: float = 0.3           # tracker: min IoU to continue a track
+    track_max_age_s: float = 2.0     # tracker: drop a track not seen for this long
+    track_min_hits: int = 2          # tracker: detections needed before a person is counted
+    flush_interval_s: float = 60.0   # one count row per camera per interval is appended to the DB
 
 
 @dataclass
@@ -162,6 +204,7 @@ class MonitoringSettings:
 class Settings:
     models: ModelSettings = field(default_factory=ModelSettings)
     detection: DetectionSettings = field(default_factory=DetectionSettings)
+    person: PersonSettings = field(default_factory=PersonSettings)
     recognition: RecognitionSettings = field(default_factory=RecognitionSettings)
     ingestion: IngestionSettings = field(default_factory=IngestionSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
@@ -173,6 +216,14 @@ class Settings:
     @property
     def enabled_cameras(self) -> List[CameraConfig]:
         return [c for c in self.cameras if c.enabled]
+
+    @property
+    def face_cameras(self) -> List[CameraConfig]:
+        return [c for c in self.enabled_cameras if c.runs_face]
+
+    @property
+    def person_cameras(self) -> List[CameraConfig]:
+        return [c for c in self.enabled_cameras if c.runs_person]
 
 
 # --------------------------------------------------------------------------- loaders
@@ -207,6 +258,22 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         arcface_input_mean=_env("FR_ARCFACE_MEAN", ARCFACE_INPUT_MEAN),
         arcface_input_std=_env("FR_ARCFACE_STD", ARCFACE_INPUT_STD),
         warmup_iterations=_env("FR_WARMUP_ITERS", 3),
+        yolo_path=_env_path("FR_YOLO_MODEL", DEFAULT_YOLO_PATH),
+    )
+    p = PersonSettings(
+        conf_threshold=_env("FR_PERSON_CONF", 0.4),
+        nms_threshold=_env("FR_PERSON_NMS", 0.45),
+        class_id=_env("FR_PERSON_CLASS_ID", COCO_PERSON_CLASS_ID),
+        num_classes=_env("FR_PERSON_NUM_CLASSES", 80),
+        input_std=_env("FR_PERSON_INPUT_STD", 255.0),
+        min_box_height=_env("FR_PERSON_MIN_HEIGHT", 30),
+        batch_size=_env("FR_PERSON_BATCH", 4),
+        max_wait_ms=_env("FR_PERSON_MAX_WAIT_MS", 8.0),
+        max_fps=_env("FR_PERSON_MAX_FPS", 0.0),
+        track_iou=_env("FR_PERSON_TRACK_IOU", 0.3),
+        track_max_age_s=_env("FR_PERSON_TRACK_MAX_AGE_S", 2.0),
+        track_min_hits=_env("FR_PERSON_TRACK_MIN_HITS", 2),
+        flush_interval_s=_env("FR_PERSON_FLUSH_S", 60.0),
     )
     d = DetectionSettings(
         det_threshold=_env("FR_DET_THRESHOLD", 0.5),
@@ -260,6 +327,7 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
     settings = Settings(
         models=m,
         detection=d,
+        person=p,
         recognition=r,
         ingestion=i,
         storage=s,
@@ -277,7 +345,11 @@ def _validate(s: Settings) -> None:
         raise ValueError("FR_INGESTION_BACKEND must be auto, gstreamer or opencv")
     if not 0.0 < s.recognition.match_threshold < 1.0:
         raise ValueError("FR_MATCH_THRESHOLD must be in (0, 1)")
-    if s.detection.batch_size < 1 or s.recognition.batch_size < 1:
+    if not 0.0 < s.person.conf_threshold < 1.0:
+        raise ValueError("FR_PERSON_CONF must be in (0, 1)")
+    if s.person.flush_interval_s <= 0:
+        raise ValueError("FR_PERSON_FLUSH_S must be > 0")
+    if s.detection.batch_size < 1 or s.recognition.batch_size < 1 or s.person.batch_size < 1:
         raise ValueError("batch sizes must be >= 1")
     for c in s.cameras:
         if c.fps <= 0:

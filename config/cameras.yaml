@@ -7,6 +7,11 @@
 #    hardware decoder. 3-5 fps is plenty for face recognition at entrances.
 #  * width/height should match the stream resolution (scaling costs CPU).
 #  * Use test://ball or file:///path/video.mp4 as url for testing.
+#
+# `tasks` picks what runs on each camera (the stream is decoded only once):
+#    tasks: [face]           face recognition (SCRFD + ArcFace)
+#    tasks: [person]         person detection + counting (YOLOv7) -> person_counts table
+#    tasks: [face, person]   both
 
 defaults:
   codec: h264          # h264 | h265 | auto
@@ -18,6 +23,7 @@ defaults:
   transport: tcp
   priority: 1.0
   enabled: true
+  tasks: [face]
 
 cameras:
   - camera_id: cam01
@@ -100,6 +106,8 @@ cameras:
     name: Camera 20
     location: Zone 20
     url: rtsp://admin:password@192.168.1.120:554/Streaming/Channels/102
+    # tasks: [person]          # this camera only counts people
+    # tasks: [face, person]    # this camera does both
     # Example of per-camera overrides:
     # roi: [200, 100, 1080, 700]
     # priority: 2.0
