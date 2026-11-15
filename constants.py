@@ -64,4 +64,4 @@ UNKNOWN_PERSON_ID = -1
 UNKNOWN_LABEL = "unknown"
 EVENT_LOGGER_NAME = "events"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3

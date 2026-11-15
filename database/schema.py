@@ -76,10 +76,26 @@ CREATE TABLE IF NOT EXISTS person_counts (
     max_count     INTEGER NOT NULL,   -- peak occupancy in the interval
     avg_count     REAL NOT NULL,
     new_persons   INTEGER NOT NULL,   -- distinct people that appeared (tracked) in the interval
+    in_count      INTEGER NOT NULL DEFAULT 0,  -- count_zone: outside -> inside crossings in the interval
+    out_count     INTEGER NOT NULL DEFAULT 0,  -- count_zone: inside -> outside crossings
+    zone_count    INTEGER NOT NULL DEFAULT 0,  -- people inside the zone at the end of the interval
     ts            REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_person_counts_ts ON person_counts(ts);
 CREATE INDEX IF NOT EXISTS idx_person_counts_camera_ts ON person_counts(camera_id, ts);
+
+-- One row per confirmed zone crossing (written every few seconds, in batches).
+CREATE TABLE IF NOT EXISTS person_crossings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id   TEXT NOT NULL,
+    track_id    INTEGER NOT NULL,
+    direction   TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    ts          REAL NOT NULL,
+    x           REAL,
+    y           REAL
+);
+CREATE INDEX IF NOT EXISTS idx_person_crossings_camera_ts ON person_crossings(camera_id, ts);
+CREATE INDEX IF NOT EXISTS idx_person_crossings_ts ON person_crossings(ts);
 """
 
 
@@ -151,15 +167,49 @@ CREATE TABLE IF NOT EXISTS person_counts (
     max_count     INTEGER NOT NULL,
     avg_count     DOUBLE PRECISION NOT NULL,
     new_persons   INTEGER NOT NULL,
+    in_count      INTEGER NOT NULL DEFAULT 0,
+    out_count     INTEGER NOT NULL DEFAULT 0,
+    zone_count    INTEGER NOT NULL DEFAULT 0,
     ts            DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_person_counts_ts ON person_counts(ts);
 CREATE INDEX IF NOT EXISTS idx_person_counts_camera_ts ON person_counts(camera_id, ts);
+
+CREATE TABLE IF NOT EXISTS person_crossings (
+    id          BIGSERIAL PRIMARY KEY,
+    camera_id   TEXT NOT NULL,
+    track_id    INTEGER NOT NULL,
+    direction   TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    ts          DOUBLE PRECISION NOT NULL,
+    x           REAL,
+    y           REAL
+);
+CREATE INDEX IF NOT EXISTS idx_person_crossings_camera_ts ON person_crossings(camera_id, ts);
+CREATE INDEX IF NOT EXISTS idx_person_crossings_ts ON person_crossings(ts);
 """
+
+# Columns added after a table first shipped: (table, column, type). CREATE TABLE IF NOT EXISTS
+# doesn't touch an existing table, so these are added to older databases on start-up.
+_ADDED_COLUMNS = [
+    ("person_counts", "in_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("person_counts", "out_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("person_counts", "zone_count", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+def _add_missing_columns(db: Database) -> None:
+    pg = getattr(db, "backend", "sqlite") == "postgres"
+    for table, col, typ in _ADDED_COLUMNS:
+        if pg:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+        elif col not in {r["name"] for r in db.fetchall(f"PRAGMA table_info({table})")}:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            log.info("Added column %s.%s", table, col)
 
 
 def init_schema(db: Database) -> None:
     db.executescript(PG_SCHEMA_SQL if getattr(db, "backend", "sqlite") == "postgres" else SCHEMA_SQL)
+    _add_missing_columns(db)
     row = db.fetchone("SELECT MAX(version) AS v FROM schema_version")
     current = row["v"] if row and row["v"] is not None else 0
     if current < SCHEMA_VERSION:

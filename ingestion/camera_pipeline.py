@@ -58,6 +58,10 @@ def build_pipeline_description(cam: CameraConfig) -> str:
     url = cam.url.strip()
     fr = Fraction(cam.fps).limit_denominator(100)
     sync = "false"
+    # Live sources: a leaky queue drops stale frames instead of building latency. Files must NOT leak:
+    # with sync=true the sink paces playback by back-pressure, and a leaky queue throws those buffers
+    # away instead, which stalls the stream after ~2 frames.
+    queue = "queue max-size-buffers=2 leaky=downstream"
 
     if url.startswith("test://"):
         pattern = url[len("test://"):] or "ball"
@@ -68,6 +72,7 @@ def build_pipeline_description(cam: CameraConfig) -> str:
     elif url.startswith("file://"):
         head = f'uridecodebin uri="{url}"'
         sync = "true"  # play files in real time
+        queue = "queue max-size-buffers=2"
     else:
         src = (
             f'rtspsrc location="{_quote_credentials(url)}" protocols={cam.transport} '
@@ -83,7 +88,7 @@ def build_pipeline_description(cam: CameraConfig) -> str:
             head = f"{src} ! decodebin"
 
     tail = (
-        "queue max-size-buffers=2 leaky=downstream ! "
+        f"{queue} ! "
         f"videorate drop-only=true ! video/x-raw,framerate={fr.numerator}/{fr.denominator} ! "
         f"videoscale ! video/x-raw,width={cam.width},height={cam.height} ! "
         "videoconvert n-threads=1 ! video/x-raw,format=BGR ! "

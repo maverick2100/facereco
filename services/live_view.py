@@ -26,6 +26,7 @@ REJECTED = "rejected"    # failed the quality gate (blurry, side-on, small)
 _FACE_COLORS = {KNOWN: (0, 200, 0), UNKNOWN: (0, 0, 230), PENDING: (200, 200, 200), REJECTED: (120, 120, 120)}
 _PERSON_COLOR = (230, 160, 0)
 _ROI_COLOR = (0, 220, 255)
+_ZONE_COLOR = (255, 0, 200)
 _STALE_S = 1.5           # drop boxes that are older than this relative to the frame shown
 
 WINDOW = "facereco - q / Esc to quit"
@@ -60,9 +61,10 @@ def _iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 class LiveView:
     def __init__(self, cameras: Dict[str, str], rois: Optional[Dict[str, Optional[Sequence[int]]]] = None,
-                 window_width: int = 1600) -> None:
-        """cameras: camera_id -> display name (only these are shown)."""
+                 window_width: int = 1600, zones: Optional[Dict[str, Optional[Sequence]]] = None) -> None:
+        """cameras: camera_id -> display name (only these are shown). zones: camera_id -> count_zone polygon."""
         self.rois = dict(rois or {})
+        self.zones = {k: np.asarray(v, np.float32) for k, v in (zones or {}).items() if v}
         self.window_width = window_width
         self._slots: Dict[str, _Slot] = {cid: _Slot(name) for cid, name in cameras.items()}
         self._lock = threading.Lock()
@@ -94,7 +96,7 @@ class LiveView:
                 s.image, s.image_ts = image, ts
 
     # ------------------------------------------------------------------ drawing
-    def _tile(self, s: _Slot, roi, w: int, h: int, status: str) -> np.ndarray:
+    def _tile(self, s: _Slot, roi, w: int, h: int, status: str, zone: Optional[np.ndarray] = None) -> np.ndarray:
         if s.image is None:
             tile = np.zeros((h, w, 3), np.uint8)
             cv2.putText(tile, "waiting for frames...", (12, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -122,6 +124,9 @@ class LiveView:
             if roi is not None:
                 x1, y1, x2, y2 = (int(round(v * scale)) for v in roi)
                 cv2.rectangle(tile, (x1 + ox, y1 + oy), (x2 + ox, y2 + oy), _ROI_COLOR, 1)
+            if zone is not None:
+                pts = np.round(zone * scale + (ox, oy)).astype(np.int32)
+                cv2.polylines(tile, [pts], True, _ZONE_COLOR, 2, cv2.LINE_AA)
             if s.persons is not None and abs(s.persons_ts - s.image_ts) <= _STALE_S:
                 for d in s.persons:
                     box(d, _PERSON_COLOR, f"person {d[4]:.2f}" if len(d) > 4 else "person")
@@ -152,7 +157,7 @@ class LiveView:
         for i, (cid, s) in enumerate(items):
             r, c = divmod(i, cols)
             canvas[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = self._tile(s, self.rois.get(cid), tw, th,
-                                                                          status.get(cid, ""))
+                                                                          status.get(cid, ""), self.zones.get(cid))
         return canvas
 
     # ------------------------------------------------------------------ main-thread loop

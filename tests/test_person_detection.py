@@ -77,9 +77,17 @@ class FakeYOLO:
         return {"coordinates": np.array([[0.5, 0.5, 100 / 640, 200 / 640]], np.float32),
                 "confidence": np.array([[0.9] + [0.0] * 79], np.float32)}
 
+    def _split(self, names=("boxes", "scores", "class_idx")):
+        # person (320,320,100x200) + its duplicate (-> NMS) + a car + a low-score person
+        boxes = np.array([[[270, 220, 370, 420], [271, 221, 371, 419], [75, 75, 125, 125], [0, 0, 50, 90]]],
+                         np.float32)
+        return {names[0]: boxes, names[1]: np.array([[0.9, 0.8, 0.95, 0.1]], np.float32),
+                names[2]: np.array([[0, 0, 2, 0]], np.float32)}
+
     def predict(self, feeds):
         return {"decoded": self._decoded, "transposed": lambda: self._decoded(True), "raw": self._raw,
-                "end2end": self._end2end, "coreml_nms": self._coreml_nms}[self.layout]()
+                "end2end": self._end2end, "coreml_nms": self._coreml_nms, "split": self._split,
+                "split_unnamed": lambda: self._split(("var_10", "var_11", "var_12"))}[self.layout]()
 
     def predict_batch(self, feeds_list):
         return [self.predict(f) for f in feeds_list]
@@ -92,7 +100,8 @@ def test_letterbox_center():
     assert canvas[100, 0, 0] == 114 and canvas[320, 320, 0] == 200
 
 
-@pytest.mark.parametrize("layout", ["decoded", "transposed", "raw", "end2end", "coreml_nms"])
+@pytest.mark.parametrize("layout", ["decoded", "transposed", "raw", "end2end", "coreml_nms", "split",
+                                    "split_unnamed"])
 def test_yolo_layouts_return_one_person_in_frame_pixels(layout):
     eng = YOLOv7Engine(FakeYOLO(layout), conf_threshold=0.4)
     dets = eng.detect(np.zeros((720, 1280, 3), np.uint8))
@@ -151,11 +160,13 @@ def test_repository_insert_and_totals():
     db = Database(":memory:")
     init_schema(db)
     repo = PersonCountRepository(db)
-    repo.insert_many([("cam01", 0, 60, 240, 1, 0, 3, 1.2, 5, 60), ("cam01", 60, 120, 240, 0, 0, 2, 0.5, 2, 120),
-                      ("cam02", 0, 60, 240, 0, 0, 1, 0.1, 1, 60)])
+    repo.insert_many([("cam01", 0, 60, 240, 1, 0, 3, 1.2, 5, 4, 1, 3, 60),
+                      ("cam01", 60, 120, 240, 0, 0, 2, 0.5, 2, 0, 3, 0, 120),
+                      ("cam02", 0, 60, 240, 0, 0, 1, 0.1, 1, 0, 0, 0, 60)])
     totals = {t["camera_id"]: t for t in repo.totals()}
     assert totals["cam01"]["total_persons"] == 7 and totals["cam01"]["peak_count"] == 3
     assert totals["cam02"]["total_persons"] == 1
+    assert (totals["cam01"]["in_count"], totals["cam01"]["out_count"]) == (4, 4)
     assert len(repo.query(camera_id="cam01")) == 2
     assert repo.delete_older_than(61) == 2
 

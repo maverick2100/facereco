@@ -158,6 +158,22 @@ def spec_warnings(path: Path) -> list:
     return out
 
 
+def time_units_isolated(path: Path, units: str) -> dict:
+    """time_units() in a child process: Core ML can abort the whole process on some graphs
+    (e.g. a YOLO export with argmax on CPU_ONLY), which should be reported, not kill this script."""
+    import json
+    import subprocess
+
+    r = subprocess.run([sys.executable, __file__, "--bench-one", units, str(path)], capture_output=True, text=True)
+    last = (r.stdout.strip().splitlines() or [""])[-1]
+    if r.returncode == 0 and last.startswith("{"):
+        return json.loads(last)
+    if r.returncode < 0 or r.returncode > 128:
+        return {"error": f"Core ML crashed running this model on {units} (signal {abs(r.returncode) % 128}) - "
+                         f"don't use FR_COMPUTE_UNITS={units} with it"}
+    return {"error": (r.stderr.strip().splitlines() or ["failed"])[-1]}
+
+
 def report(path: Path, units: str, bench: bool) -> None:
     print(f"\n=== {path}")
     if not path.exists():
@@ -190,10 +206,7 @@ def report(path: Path, units: str, bench: bool) -> None:
     if bench:
         rows = {}
         for u in ("CPU_ONLY", "CPU_AND_NE"):
-            try:
-                rows[u] = time_units(path, u)
-            except Exception as exc:
-                rows[u] = {"error": str(exc)}
+            rows[u] = time_units_isolated(path, u)
         for u, r in rows.items():
             print(f"  {u:<11}: " + (r["error"] if "error" in r else f"{r['ms']:7.2f} ms/inference, "
                                                                       f"CPU {r['cpu_ms']:6.2f} ms"))
@@ -209,7 +222,17 @@ def main() -> int:
     ap.add_argument("models", nargs="*", help=".mlpackage / .mlmodel paths (default: from .env)")
     ap.add_argument("--units", default=None, help="compute units for the plan (default FR_COMPUTE_UNITS)")
     ap.add_argument("--no-bench", action="store_true", help="skip the CPU_ONLY vs CPU_AND_NE timing")
+    ap.add_argument("--bench-one", nargs=2, metavar=("UNITS", "MODEL"), help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.bench_one:
+        import json
+
+        try:
+            print(json.dumps(time_units(Path(args.bench_one[1]), args.bench_one[0])))
+            return 0
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     s = load_settings()
     units = args.units or s.models.compute_units

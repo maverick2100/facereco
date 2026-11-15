@@ -81,10 +81,13 @@ def test_repositories_roundtrip(db):
     assert events.count() == 3 and len(events.query(known_only=True)) == 2
 
     counts = PersonCountRepository(db)
-    counts.insert_many([("c1", now - 120, now - 60, 100, 2, 0, 3, 1.5, 4, now - 60),
-                        ("c1", now - 60, now, 100, 1, 0, 2, 1.0, 2, now)])
+    counts.insert_many([("c1", now - 120, now - 60, 100, 2, 0, 3, 1.5, 4, 3, 1, 2, now - 60),
+                        ("c1", now - 60, now, 100, 1, 0, 2, 1.0, 2, 0, 2, 0, now)])
+    counts.insert_crossings([("c1", 5, "in", now - 70, 640.0, 600.0), ("c1", 5, "out", now - 10, 300.0, 600.0)])
+    assert [c["direction"] for c in counts.crossings()] == ["out", "in"]
     t = counts.totals()
     assert t[0]["total_persons"] == 6 and t[0]["peak_count"] == 3 and t[0]["camera_name"] == "Front door"
+    assert (t[0]["in_count"], t[0]["out_count"]) == (3, 3)
 
     assert events.delete_older_than(now - 3) == 2
     assert counts.delete_older_than(now - 30) == 1

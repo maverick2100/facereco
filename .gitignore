@@ -21,3 +21,14 @@ models/*.mlpackage/
 
 # database credentials
 config/db_constants.py
+models/onnx/
+*.onnx
+data/test_media/
+
+# local TLS cert/key and stray images
+*.key
+*.crt
+*.pem
+*.jpeg
+*.jpg
+*.png

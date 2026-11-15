@@ -3,6 +3,7 @@
   FrameScheduler (person) --(batch)--> [person-detector thread]
       YOLOv7 (ANE) -> person filter / ROI -> tracker -> PersonCounter
       every FR_PERSON_FLUSH_S: one row per camera appended to `person_counts`
+      cameras with a `count_zone`: IN / OUT crossings -> `person_crossings` (batched every ~2 s)
 
 Runs alongside the face pipeline; both share the Neural Engine.
 """
@@ -25,6 +26,8 @@ from scheduler.batch_scheduler import BatchScheduler
 from scheduler.frame_scheduler import FrameScheduler
 
 log = logging.getLogger(__name__)
+
+CROSSING_WRITE_S = 2.0   # crossings reach the DB within ~2 s, batched into one INSERT
 
 
 def load_yolo(models: ModelSettings, person: PersonSettings) -> YOLOv7Engine:
@@ -49,7 +52,10 @@ class PersonCountService:
         self.live = live
         self._last_retention = 0.0
         self.counter = PersonCounter(self.cameras, settings.flush_interval_s, settings.track_iou,
-                                     settings.track_max_age_s, settings.track_min_hits)
+                                     settings.track_max_age_s, settings.track_min_hits,
+                                     zones={c.camera_id: c.count_zone for c in cameras if c.count_zone},
+                                     zone_anchor=settings.zone_anchor, zone_min_frames=settings.zone_min_frames)
+        self._last_crossing_write = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -76,12 +82,14 @@ class PersonCountService:
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
+        self._write_crossings(force=True)
         self._write(self.counter.flush())  # keep the partial last interval
 
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
         batcher = BatchScheduler(self.frames.get_frames, self.settings.batch_size, self.settings.max_wait_ms)
         while not self._stop.is_set():
+            self._write_crossings()
             if self.counter.due():
                 self._write(self.counter.flush())
                 self._apply_retention()
@@ -110,6 +118,21 @@ class PersonCountService:
                     self.perf.incr("persons_new", new)
                 if self.live is not None:
                     self.live.publish_persons(frame.camera_id, frame.image, frame.timestamp, dets)
+
+    def _write_crossings(self, force: bool = False) -> None:
+        """One batched INSERT for every crossing since the last write (at most every CROSSING_WRITE_S)."""
+        now = time.monotonic()
+        if not force and now - self._last_crossing_write < CROSSING_WRITE_S:
+            return
+        self._last_crossing_write = now
+        rows = self.counter.take_crossings()
+        if not rows:
+            return
+        try:
+            self.repo.insert_crossings(c.as_row() for c in rows)
+            self.perf.incr("person_crossings", len(rows))
+        except Exception:
+            log.exception("Failed to write %d zone crossings", len(rows))
 
     def _write(self, records: List[CountRecord]) -> None:
         if not records:

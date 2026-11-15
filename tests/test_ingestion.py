@@ -112,3 +112,11 @@ def test_batch_scheduler_collects_until_max():
     assert len(b.next_batch()) == 4
     assert b.next_batch() == [8, 9]
     assert b.next_batch() == []
+
+
+def test_file_sources_use_a_non_leaky_queue():
+    from ingestion.camera_pipeline import build_pipeline_description
+    f = build_pipeline_description(CameraConfig.from_dict({"camera_id": "f", "url": "file:///tmp/a.mp4"}))
+    live = build_pipeline_description(CameraConfig.from_dict({"camera_id": "l", "url": "rtsp://h/s"}))
+    assert "leaky" not in f and "sync=true" in f          # files: paced by back-pressure, real time
+    assert "leaky=downstream" in live and "sync=false" in live

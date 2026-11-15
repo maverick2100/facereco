@@ -16,6 +16,11 @@ Usage:
     python main.py run --show                # same, plus a window with live boxes + names (q to quit)
     python main.py run --show cam01,cam02    # window shows only these cameras
     python main.py db-check                  # test the database connection (SQLite or PostgreSQL)
+    python main.py cameras                   # what the camera source (cameras.yaml or your SP) returns
+
+`run` follows the camera source: with FR_CAMERA_SOURCE=db it calls your stored procedure, starts face
+recognition / person counting per camera as the SP says, and restarts the pipelines when the SP's
+answer changes (NOTIFY camera_changed, or a re-check every FR_CAMERA_POLL_S).
 """
 from __future__ import annotations
 
@@ -66,6 +71,8 @@ from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
 from services.enrollment_service import EnrollmentService  # noqa: E402
 from services.event_service import EventService  # noqa: E402
 from services.live_view import LiveView  # noqa: E402
+from ingestion.camera_pipeline import mask_url  # noqa: E402
+from services.camera_source import CameraSource, describe_change, fingerprint  # noqa: E402
 from services.recognition_service import RecognitionService  # noqa: E402
 from utils.logger import setup_logging  # noqa: E402
 from utils.time_utils import iso, parse_datetime  # noqa: E402
@@ -110,7 +117,8 @@ class FaceRecognitionApp:
         self.live: Optional[LiveView] = None
         if show is not None:
             shown = [c for c in self.cameras if not show or c.camera_id in show]
-            self.live = LiveView({c.camera_id: c.name for c in shown}, {c.camera_id: c.roi for c in shown})
+            self.live = LiveView({c.camera_id: c.name for c in shown}, {c.camera_id: c.roi for c in shown},
+                                 zones={c.camera_id: c.count_zone for c in shown if c.runs_person})
         self._stop = threading.Event()
 
     def _make_ingestion(self):
@@ -131,7 +139,7 @@ class FaceRecognitionApp:
             raise RuntimeError("No enabled cameras in config/cameras.yaml")
         log.info("Starting with %d cameras (face: %d, person: %d), compute units=%s", len(self.cameras),
                  len(self.face_cameras), len(self.person_cameras), s.models.compute_units)
-        self.camera_repo.sync(s.cameras)
+        self.camera_repo.sync(self.cameras)
 
         if self.face_cameras:
             self.inference.load()
@@ -209,7 +217,12 @@ class FaceRecognitionApp:
             self.stop()
 
     def _camera_status(self) -> Dict[str, str]:
-        return {h["camera_id"]: f'{h["status"]} {h["fps"]:.1f} fps' for h in self.health_registry.snapshot()}
+        st = {h["camera_id"]: f'{h["status"]} {h["fps"]:.1f} fps' for h in self.health_registry.snapshot()}
+        if self.person_service is not None:
+            for cid, p in self.person_service.stats()["per_camera"].items():
+                if "in" in p and cid in st:
+                    st[cid] += f'  IN {p["in"]} OUT {p["out"]} inside {p["in_zone"]}'
+        return st
 
     def stop(self) -> None:
         log.info("Shutting down...")
@@ -231,19 +244,161 @@ def _repos(settings: Settings):
     return db, PersonRepository(db), EmbeddingRepository(db), EventRepository(db)
 
 
+class Supervisor:
+    """Runs whatever the camera source says, and follows it when it changes.
+
+    1. load the cameras (cameras.yaml, or your SP with FR_CAMERA_SOURCE=db)
+    2. start face recognition / person counting on each camera according to its use case
+    3. watch for changes (NOTIFY camera_changed, or a re-check every FR_CAMERA_POLL_S); when the
+       list differs, flush what was counted so far and restart the pipelines with the new list
+    """
+
+    SETTLE_S = 1.0          # wait for a burst of changes (frontend saving several cameras) to finish
+    RETRY_S = 30.0          # after a failed start (model missing, DB down), try again this often
+
+    def __init__(self, settings: Settings, source: CameraSource, show: Optional[List[str]] = None,
+                 only: Optional[set] = None) -> None:
+        self.settings = settings
+        self.source = source
+        self.show = show
+        self.only = only
+        self._stop = threading.Event()
+        self._cycle = threading.Event()
+        self._next = None
+
+    def _load(self):
+        cams = self.source.load()
+        if self.only:
+            cams = [c for c in cams if c.camera_id in self.only]
+        return cams
+
+    def _load_until_ok(self):
+        while not self._stop.is_set():
+            try:
+                return self._load()
+            except Exception as exc:
+                log.error("Could not load cameras from %s: %s - retrying in %.0fs", self.source.description,
+                          exc, self.settings.camera_source.poll_s)
+                self._stop.wait(self.settings.camera_source.poll_s)
+        return []
+
+    def _watch(self, current, cycle: threading.Event) -> None:
+        fp = fingerprint(current)
+        poll = self.settings.camera_source.poll_s
+        while not cycle.is_set():
+            notified = self.source.wait_for_change(poll, cycle)
+            if cycle.is_set():
+                return
+            if notified:
+                cycle.wait(self.SETTLE_S)
+            try:
+                new = self._load()
+            except Exception as exc:
+                log.warning("Camera re-check failed (%s) - keeping the current cameras", exc)
+                continue
+            if fingerprint(new) != fp:
+                log.info("Camera list changed (%s) - restarting pipelines", describe_change(current, new))
+                self._next = new
+                cycle.set()
+                return
+
+    def _summary(self, cams) -> str:
+        face = [c.camera_id for c in cams if c.runs_face]
+        person = [c.camera_id for c in cams if c.runs_person]
+        return f"{len(cams)} cameras - face: {', '.join(face) or '-'} | person: {', '.join(person) or '-'}"
+
+    def _run_once(self, cams, cycle: threading.Event, watcher: threading.Thread) -> bool:
+        """Run the pipelines for `cams` until `cycle` is set. False if they failed to start."""
+        log.info("Running %s", self._summary(cams))
+        show = None                                     # None = no window, [] = every camera
+        if self.show is not None:
+            running = {c.camera_id for c in cams}
+            show = [c for c in self.show if c in running]
+        app = None
+        try:
+            app = FaceRecognitionApp(self.settings, cams, show)
+            app.start()
+            watcher.start()
+            if app.live is not None:
+                app.live.run_window(cycle, app._camera_status)   # q / Esc / closing the window sets cycle
+                if self._next is None:                            # closed by the user, not a reload
+                    self._stop.set()
+            else:
+                cycle.wait()
+            return True
+        except Exception:
+            log.exception("Pipelines failed to start - retrying in %.0fs (or when the cameras change)",
+                          self.RETRY_S)
+            return False
+        finally:
+            if app is not None:
+                try:
+                    app.stop()     # flushes the partial person-count interval and pending crossings
+                except Exception:
+                    log.exception("Error while stopping pipelines")
+
+    def run_forever(self) -> None:
+        def _signal(*_):
+            self._stop.set()
+            self._cycle.set()
+
+        signal.signal(signal.SIGINT, _signal)
+        signal.signal(signal.SIGTERM, _signal)
+        log.info("Camera source: %s", self.source.description)
+        cams = self._load_until_ok()
+        try:
+            while not self._stop.is_set():
+                self._cycle = cycle = threading.Event()
+                if self._stop.is_set():
+                    break
+                self._next = None
+                watcher = threading.Thread(target=self._watch, args=(cams, cycle), name="camera-watch", daemon=True)
+                if not cams:
+                    log.warning("No enabled cameras from %s - waiting for one to be added", self.source.description)
+                    watcher.start()
+                    cycle.wait()
+                elif not self._run_once(cams, cycle, watcher):
+                    # start failed: retry after RETRY_S, or sooner if the camera list changes
+                    if not watcher.is_alive() and watcher.ident is None:
+                        watcher.start()
+                    cycle.wait(self.RETRY_S)
+                cycle.set()
+                if watcher.ident is not None:
+                    watcher.join(timeout=5)
+                if self._next is not None:
+                    cams = self._next
+                elif not self._stop.is_set():
+                    cams = self._load_until_ok()
+        finally:
+            self.source.close()
+
+
 def cmd_run(settings: Settings, args) -> int:
-    cams = settings.enabled_cameras
-    if args.cameras:
-        wanted = set(args.cameras.split(","))
-        cams = [c for c in settings.cameras if c.camera_id in wanted]
+    only = set(args.cameras.split(",")) if args.cameras else None
     show = None
     if args.show is not None:
         show = [c for c in args.show.split(",") if c]
-        unknown = set(show) - {c.camera_id for c in cams}
-        if unknown:
-            print(f"--show: unknown or not running camera(s): {', '.join(sorted(unknown))}")
-            return 2
-    FaceRecognitionApp(settings, cams, show).run_forever()
+    Supervisor(settings, CameraSource(settings.camera_source, settings.storage), show, only).run_forever()
+    return 0
+
+
+def cmd_cameras(settings: Settings, args) -> int:
+    """Show what the camera source (cameras.yaml or your SP) returns, without starting anything."""
+    src = CameraSource(settings.camera_source, settings.storage)
+    try:
+        cams = src.load()
+    except Exception as exc:
+        print(f"FAILED to load cameras from {src.description}: {exc}")
+        return 1
+    finally:
+        src.close()
+    print(f"source: {src.description}")
+    print(f"{'camera_id':<14} {'name':<22} {'face':<5} {'person':<7} {'zone':<5} url")
+    for c in cams:
+        print(f"{c.camera_id:<14} {c.name[:22]:<22} {'yes' if c.runs_face else '-':<5} "
+              f"{'yes' if c.runs_person else '-':<7} {'yes' if c.count_zone else '-':<5} {mask_url(c.url)}")
+    print(f"{len(cams)} enabled cameras: face {sum(c.runs_face for c in cams)}, "
+          f"person {sum(c.runs_person for c in cams)}")
     return 0
 
 
@@ -301,7 +456,8 @@ def cmd_counts(settings: Settings, args) -> int:
         path = Path(args.csv) if args.csv else EXPORTS_DIR / f"person_counts_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         cols = ["period_start_time", "period_end_time", "camera_id", "camera_name", "camera_location", "frames",
-                "current_count", "min_count", "max_count", "avg_count", "new_persons"]
+                "current_count", "min_count", "max_count", "avg_count", "new_persons", "in_count", "out_count",
+                "zone_count"]
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
@@ -311,11 +467,13 @@ def cmd_counts(settings: Settings, args) -> int:
         print(path)
     else:
         totals = repo.totals(since, until, args.camera)
-        print(f"{'camera':<12} {'name':<24} {'persons':>8} {'peak':>6} {'frames':>9}  from -> to")
+        print(f"{'camera':<12} {'name':<24} {'persons':>8} {'peak':>6} {'in':>6} {'out':>6} {'frames':>9}  from -> to")
         for t in totals:
             print(f"{t['camera_id']:<12} {(t['camera_name'] or ''):<24} {t['total_persons']:>8} "
-                  f"{t['peak_count']:>6} {t['frames']:>9}  {iso(t['first_ts'])} -> {iso(t['last_ts'])}")
-        print(f"{'TOTAL':<12} {'':<24} {sum(t['total_persons'] for t in totals):>8}")
+                  f"{t['peak_count']:>6} {t['in_count'] or 0:>6} {t['out_count'] or 0:>6} {t['frames']:>9}  "
+                  f"{iso(t['first_ts'])} -> {iso(t['last_ts'])}")
+        print(f"{'TOTAL':<12} {'':<24} {sum(t['total_persons'] for t in totals):>8} {'':>6} "
+              f"{sum(t['in_count'] or 0 for t in totals):>6} {sum(t['out_count'] or 0 for t in totals):>6}")
     db.close()
     return 0
 
@@ -383,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--csv", nargs="?", const="", help="export rows to CSV (optional output path)")
 
     sub.add_parser("info", help="show model/environment info")
+    sub.add_parser("cameras", help="list the cameras + use cases the camera source (yaml or SP) returns")
 
     sub.add_parser("db-check", help="test the database connection and create tables")
     return p
@@ -396,6 +555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     commands = {
         None: cmd_run, "run": cmd_run, "enroll": cmd_enroll, "persons": cmd_persons,
         "delete-person": cmd_delete_person, "export": cmd_export, "counts": cmd_counts, "info": cmd_info,
+        "cameras": cmd_cameras,
         "db-check": cmd_db_check,
     }
     if args.command is None:

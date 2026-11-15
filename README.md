@@ -16,7 +16,7 @@ This system recognizes faces in real time from up to 20 RTSP cameras. SCRFD find
 
 ```bash
 # system packages: Python 3.12, GStreamer (includes the VideoToolbox hardware decoder) and build tools for PyGObject
-brew install python@3.12 gstreamer gobject-introspection pkg-config cairo
+brew install python@3.12 gstreamer gobject-introspection pkg-config cairo ffmpeg
 
 git clone https://github.com/maverick2100/facereco.git
 cd facereco
@@ -25,7 +25,6 @@ cd facereco
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-pip install PyGObject          # GStreamer Python bindings
 ```
 
 Check the install. It should print the GStreamer version and an empty "missing" list:
@@ -34,7 +33,7 @@ Check the install. It should print the GStreamer version and an empty "missing" 
 python -c "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; Gst.init(None); print(Gst.version_string()); print('missing:', [e for e in ('rtspsrc','rtph264depay','h264parse','vtdec','videorate','videoconvert','appsink') if not Gst.ElementFactory.find(e)])"
 ```
 
-> Use Python **3.12**, not the system Python 3.9. Homebrew's `pygobject3` package is built for a newer Python than coremltools supports, so `pip install PyGObject` inside the venv is the reliable route.
+> Use Python **3.12**, not the system Python 3.9. `requirements.txt` holds every Python dependency, pinned to the tested versions: the app, the GStreamer bindings (PyGObject, which needs the brew packages above), PostgreSQL, model conversion (torch, onnx) and tests. Run facereco natively, not in Docker: Core ML, the Neural Engine and VideoToolbox decoding only exist on macOS itself.
 
 ### 3. Configure
 
@@ -64,6 +63,22 @@ cameras:
 | `[face]` | SCRFD + ArcFace recognition | `events` |
 | `[person]` | YOLOv7 person detection + counting | `person_counts` |
 | `[face, person]` | both | both |
+
+**Counting people IN and OUT of a region:** add a `count_zone` polygon to a person camera. A person whose feet move from outside the region to inside counts as one **IN**, and inside to outside counts as one **OUT**. The new side must hold for `FR_PERSON_ZONE_MIN_FRAMES` frames (default 2), so someone standing on the edge isn't counted again and again. Points can be pixels or 0–1 fractions of the frame, which is what a frontend drawing tool usually gives.
+
+```yaml
+  - camera_id: cam05
+    url: rtsp://...
+    tasks: [person]
+    count_zone: [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]]   # right half of the frame
+```
+
+| Table | What it holds |
+|---|---|
+| `person_counts` | one row per camera every `FR_PERSON_FLUSH_S`, now with `in_count`, `out_count`, `zone_count` (people inside the region at the end of the interval) |
+| `person_crossings` | one row per crossing: `camera_id`, `track_id`, `direction` (`in`/`out`), `ts`, `x`, `y`. Written in one batch every ~2 s |
+
+`python main.py counts` shows IN/OUT per camera, and `run --show` draws the region with live IN/OUT totals. Existing databases get the new columns automatically on start-up.
 
 Passwords may contain special characters (`@ # / ?`). They're handled automatically and are never written to the database.
 
@@ -95,6 +110,31 @@ python scripts/migrate_sqlite_to_postgres.py  # optional: copy existing SQLite d
 
 `.env` is in `.gitignore`, so your credentials stay out of git, and the password is masked in every log line.
 
+### 3c. Optional: cameras and use cases from your stored procedure (frontend-driven)
+
+Instead of `cameras.yaml`, the camera list can come from the database, so the frontend decides which cameras run face recognition and which run person counting. Set this in `.env`:
+
+```bash
+FR_CAMERA_SOURCE=db
+FR_CAMERA_SQL=SELECT * FROM sp_get_cameras()   # or your own SP / query
+```
+
+`python main.py run` then calls the SP and starts the right use case on each camera. Results go to the same tables as before (`events`, `person_counts`, `person_crossings`). When the SP's answer changes (a camera is added, removed or switched between face and person, or its zone is redrawn), the system saves what it has counted so far and restarts the pipelines with the new list. This takes a few seconds and needs no manual restart.
+
+- **The SP's rows:** one row per camera. Columns `camera_id`, `url`, and either `tasks` (`face`, `person`, `face,person` or `both`) or boolean `face` / `person` columns. Optional columns: `name`, `location`, `enabled`, `count_zone`, `roi`, `fps`, `width`, `height`, `codec`. Common alternative names such as `id`, `rtsp_url`, `use_case` and `is_active` also work, other columns are ignored, and NULLs fall back to `defaults:` in `cameras.yaml`. A bad row is logged and skipped, and the other cameras keep running.
+- **Instant updates:** on PostgreSQL, anything that runs `NOTIFY camera_changed` triggers an immediate reload. Otherwise changes are picked up by a re-check every `FR_CAMERA_POLL_S` (30 s).
+- **No SP yet?** [database/sql/camera_config_postgres.sql](database/sql/camera_config_postgres.sql) creates a `camera_config` table, `sp_get_cameras()`, `sp_upsert_camera(...)`, `sp_delete_camera(...)`, and a trigger that sends the NOTIFY:
+
+  ```bash
+  psql "$FR_DATABASE_URL" -f database/sql/camera_config_postgres.sql
+  ```
+  ```sql
+  SELECT sp_upsert_camera('cam07', 'Back door', 'rtsp://user:pass@10.0.0.7/stream2', false, true,
+                          '[[0.5,0],[1,0],[1,1],[0.5,1]]');   -- person counting with an IN/OUT zone
+  ```
+- **End-to-end test:** `python scripts/e2e_test.py` adds two temporary cameras through the SPs and checks the whole chain against your database: pipelines start, face events, person counts and IN/OUT crossings arrive, a use-case change via the SP restarts within seconds, and a disabled camera stops. Then it removes them. Add `--fake-models` to test without `.mlpackage` files, or `--face-url` / `--person-url file:///clip.mp4` to use real video with the real models.
+- **Check it:** `python main.py cameras` prints what the SP returns, including which cameras run face, which run person counting, and which have a zone, without starting anything.
+
 ### 4. Add the models
 
 ```
@@ -105,12 +145,13 @@ models/yolov7.mlpackage     # only needed if any camera has tasks: [person]
 
 The YOLOv7 engine ([person_detection/yolo_engine.py](person_detection/yolo_engine.py)) works out the output layout from the tensor shapes. It handles decoded `(1, N, 85)` output (`export.py --grid`), raw `(1, 3, H, W, 85)` heads, `--end2end` NMS output `(N, 7)`, and Core ML NMS pipelines (`coordinates` / `confidence`). It logs the layout it detected at start-up. For a model with array input, pixels are divided by `FR_PERSON_INPUT_STD` (255). For a model with image input, the `1/255` scale must be built into the model. If your model wasn't trained on COCO, set `FR_PERSON_NUM_CLASSES` and `FR_PERSON_CLASS_ID`.
 
-**4b. Optional: convert from InsightFace ONNX** (e.g. `buffalo_l`: `det_10g.onnx` + `w600k_r50.onnx`). Use a separate venv, because torch is large:
+**4b. Optional: convert from ONNX** (e.g. InsightFace `buffalo_l`: `det_10g.onnx` + `w600k_r50.onnx`, and a YOLOv7 export). The conversion packages come with `requirements.txt`:
 
 ```bash
-python3.12 -m venv ~/convenv && ~/convenv/bin/pip install coremltools torch==2.5.1 onnx onnx2torch
-~/convenv/bin/python scripts/convert_models.py --scrfd det_10g.onnx --arcface w600k_r50.onnx --out models/
+python scripts/convert_models.py --scrfd det_10g.onnx --arcface w600k_r50.onnx --yolo yolov7.onnx --out models/
 ```
+
+SCRFD must be a version **with landmarks** (`kps` outputs, like `det_10g.onnx`); the face pipeline needs them to align faces.
 
 The converter applies the ANE optimizations described in [Making sure the models run on the ANE](#making-sure-the-models-run-on-the-ane).
 
@@ -253,7 +294,7 @@ The code detects image vs. array inputs, output names and output layouts automat
 
 | Problem | Fix |
 |---|---|
-| `No module named 'gi'` | Run `pip install PyGObject` inside the venv (step 2). |
+| `No module named 'gi'` | Install the brew packages from step 2, then `pip install -r requirements.txt` inside the venv. |
 | Camera status `reconnecting`, error `Not found` | Wrong RTSP path. Test with `scripts/test_gstreamer.py --url ...`. |
 | Camera never streams | Try `codec: h265` or `codec: auto`. Check that the URL works in VLC. |
 | `Unrecognised SCRFD outputs` | Run `scripts/test_coreml.py` to see the output shapes. Set `FR_SCRFD_SIGMOID=true` if scores are logits. |

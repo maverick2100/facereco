@@ -6,7 +6,8 @@ from typing import Iterable, List, Optional, Sequence
 from database.connection import Database
 
 COUNT_COLUMNS = ("camera_id", "period_start", "period_end", "frames", "current_count", "min_count",
-                 "max_count", "avg_count", "new_persons", "ts")
+                 "max_count", "avg_count", "new_persons", "in_count", "out_count", "zone_count", "ts")
+CROSSING_COLUMNS = ("camera_id", "track_id", "direction", "ts", "x", "y")
 
 
 class PersonCountRepository:
@@ -21,6 +22,22 @@ class PersonCountRepository:
             marks = ", ".join("?" * len(COUNT_COLUMNS))
             self.db.executemany(f"INSERT INTO person_counts({cols}) VALUES ({marks})", payload)
         return len(payload)
+
+    def insert_crossings(self, rows: Iterable[Sequence]) -> int:
+        """rows: tuples in CROSSING_COLUMNS order (one per IN/OUT crossing)."""
+        payload = [tuple(r) for r in rows]
+        if payload:
+            self.db.executemany(f"INSERT INTO person_crossings({', '.join(CROSSING_COLUMNS)}) VALUES (?, ?, ?, ?, ?, ?)",
+                                payload)
+        return len(payload)
+
+    def crossings(self, since: Optional[float] = None, until: Optional[float] = None,
+                  camera_id: Optional[str] = None, limit: int = 1000) -> List[dict]:
+        where, params = self._where(since, until, camera_id)
+        sql = "SELECT p.* FROM person_crossings p" + where + " ORDER BY p.ts DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return [dict(r) for r in self.db.fetchall(sql, params)]
 
     @staticmethod
     def _where(since: Optional[float], until: Optional[float], camera_id: Optional[str]):
@@ -51,10 +68,13 @@ class PersonCountRepository:
         where, params = self._where(since, until, camera_id)
         sql = ("SELECT p.camera_id, c.name AS camera_name, SUM(p.new_persons) AS total_persons, "
                "MAX(p.max_count) AS peak_count, SUM(p.frames) AS frames, "
+               "SUM(p.in_count) AS in_count, SUM(p.out_count) AS out_count, "
                "MIN(p.period_start) AS first_ts, MAX(p.period_end) AS last_ts "
                "FROM person_counts p LEFT JOIN cameras c ON c.id = p.camera_id" + where +
                " GROUP BY p.camera_id, c.name ORDER BY p.camera_id")
         return [dict(r) for r in self.db.fetchall(sql, params)]
 
     def delete_older_than(self, ts: float) -> int:
-        return self.db.execute("DELETE FROM person_counts WHERE ts < ?", (ts,)).rowcount
+        n = self.db.execute("DELETE FROM person_counts WHERE ts < ?", (ts,)).rowcount
+        self.db.execute("DELETE FROM person_crossings WHERE ts < ?", (ts,))
+        return n

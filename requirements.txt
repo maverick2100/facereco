@@ -1,15 +1,35 @@
-# Python 3.10 - 3.12 (arm64 native) recommended.
-coremltools>=8.3
-numpy>=1.24
-opencv-python-headless>=4.9
-Pillow>=10.0
-PyYAML>=6.0
-python-dotenv>=1.0
-psutil>=5.9
-psycopg[binary]>=3.1      # PostgreSQL (only used when FR_DATABASE_URL / FR_PG_HOST is set)
-psycopg-pool>=3.2
-pytest>=7.4
+# facereco - every Python dependency, pinned to the versions tested on a Mac mini M4 (macOS, arm64).
+#
+# Python 3.12 (arm64 native). Install:
+#   brew install python@3.12 gstreamer gobject-introspection pkg-config cairo ffmpeg
+#   /opt/homebrew/bin/python3.12 -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip && pip install -r requirements.txt
+#
+# Run facereco natively, not in Docker: Core ML / the Neural Engine and VideoToolbox decoding only
+# exist on macOS itself.
 
-# GStreamer Python bindings are installed separately (see README):
-#   brew install gstreamer gobject-introspection pkg-config cairo
-#   pip install PyGObject
+# --- core: inference on the Neural Engine, image handling, config
+coremltools==9.0
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
+Pillow==13.0.0
+PyYAML==6.0.3
+python-dotenv==1.2.4
+psutil==7.2.2
+
+# --- video ingestion: GStreamer Python bindings (needs the brew packages above)
+PyGObject==3.58.1
+
+# --- database: PostgreSQL (SQLite is built into Python)
+psycopg[binary]==3.3.9
+psycopg-pool==3.3.3
+
+# --- model conversion: ONNX -> Core ML (scripts/convert_models.py) and ONNX reference checks
+torch==2.5.1
+onnx==1.23.2
+onnx2torch==1.5.15
+onnxruntime==1.32.0
+
+# --- tests (+ yt-dlp for scripts/dummy_rtsp.py: YouTube videos as dummy RTSP cameras)
+pytest==9.2.0
+yt-dlp==2026.10.26

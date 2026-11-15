@@ -19,8 +19,8 @@ from database.connection import Database, PostgresDatabase, open_database  # noq
 from database.schema import init_schema  # noqa: E402
 
 # Parent tables first (foreign keys).
-TABLES = ["cameras", "persons", "embeddings", "events", "person_counts"]
-SERIAL_TABLES = ["persons", "embeddings", "events", "person_counts"]
+TABLES = ["cameras", "persons", "embeddings", "events", "person_counts", "person_crossings"]
+SERIAL_TABLES = ["persons", "embeddings", "events", "person_counts", "person_crossings"]
 CHUNK = 2000
 
 
@@ -40,6 +40,7 @@ def main() -> int:
         return 1
 
     src = Database(src_path)
+    init_schema(src)  # an older SQLite file gets the newer tables/columns (empty) first
     dst = open_database(settings.storage)
     assert isinstance(dst, PostgresDatabase)
     init_schema(dst)

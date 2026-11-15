@@ -8,6 +8,8 @@ by shape (see `YOLOv7Engine.decode`):
   * raw heads    (1, 3, H, W, 5+nc) per stride, or NCHW (1, 3*(5+nc), H, W)  - export without --grid
   * end2end NMS  (N, 7) [batch, x1, y1, x2, y2, cls, score]                  - export --end2end
   * Core ML NMS  "coordinates" (N, 4) normalised cx,cy,w,h + "confidence" (N, nc)
+  * split        "boxes" (1, N, 4) x1,y1,x2,y2 + "scores" (1, N) best-class score x objectness
+                 + "class_idx" (1, N) best class  - decode + argmax inside the graph, no NMS
 
 Only the person class is kept. Boxes are returned in original-frame pixels.
 """
@@ -132,6 +134,11 @@ class YOLOv7Engine:
             self._log_layout("Core ML NMS (coordinates/confidence)")
             return self._decode_coreml_nms(arrays["coordinates"], arrays["confidence"])
 
+        split = self._find_split(arrays)
+        if split is not None:
+            self._log_layout("split boxes(x1y1x2y2) / scores / class_idx")
+            return self._decode_split(*split)
+
         heads = []
         for a in arrays.values():
             if a.ndim == 5 and a.shape[-1] == no:
@@ -200,6 +207,33 @@ class YOLOv7Engine:
         if not all_boxes:
             return np.zeros((0, 4), np.float32), np.zeros((0,), np.float32), False
         return np.concatenate(all_boxes), np.concatenate(all_scores), False
+
+    _CLASS_NAMES = ("class_idx", "classes", "class_ids", "labels", "class")
+
+    def _find_split(self, arrays: Dict[str, np.ndarray]):
+        """(boxes (N,4), scores (N,), classes (N,)) when the model emits them separately, else None."""
+        if len(arrays) != 3:
+            return None
+        # boxes = the (.., N, 4) array; the other two hold N values each
+        boxes = [k for k, v in arrays.items() if v.ndim in (2, 3) and v.shape[-1] == 4
+                 and all(o.size * 4 == v.size for j, o in arrays.items() if j != k)]
+        if len(boxes) != 1:
+            return None
+        vecs = [k for k in arrays if k != boxes[0]]
+        b = arrays[boxes[0]].reshape(-1, 4)
+        cls = next((k for k in vecs if k.lower() in self._CLASS_NAMES), None)
+        if cls is None:  # names lost in conversion: the class array holds whole numbers
+            whole = [k for k in vecs if np.all(arrays[k] == np.round(arrays[k]))]
+            if len(whole) != 1:
+                return None
+            cls = whole[0]
+        score = next(k for k in vecs if k != cls)
+        return b, arrays[score].reshape(-1), arrays[cls].reshape(-1)
+
+    def _decode_split(self, boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray
+                      ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        idx = np.nonzero((np.round(classes) == self.class_id) & (scores >= self.conf_threshold))[0]
+        return boxes[idx], scores[idx], False
 
     def _decode_end2end(self, a: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool]:
         mask = (a[:, 5].round() == self.class_id) & (a[:, 6] >= self.conf_threshold)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -72,6 +73,9 @@ class CameraConfig:
     priority: float = 1.0        # >1 = scheduled more aggressively
     roi: Optional[List[int]] = None  # [x1, y1, x2, y2] in delivered resolution
     tasks: List[str] = field(default_factory=lambda: [TASK_FACE])  # face | person | both
+    # Person IN/OUT region: polygon [[x, y], ...] (>= 3 points). Pixels in delivered resolution, or
+    # 0..1 fractions of width/height (what a frontend drawing tool usually gives). Stored as pixels.
+    count_zone: Optional[List[List[float]]] = None
 
     @property
     def runs_face(self) -> bool:
@@ -106,7 +110,26 @@ class CameraConfig:
         cam = cls(**kwargs)
         if cam.roi is not None and len(cam.roi) != 4:
             raise ValueError(f"camera {cam.camera_id}: roi must be [x1, y1, x2, y2]")
+        if cam.count_zone is not None:
+            cam.count_zone = _parse_zone(cam.camera_id, cam.count_zone, cam.width, cam.height)
         return cam
+
+
+def _parse_zone(camera_id: str, zone: Any, width: int, height: int) -> Optional[List[List[float]]]:
+    if isinstance(zone, str):                     # JSON text, e.g. straight from a DB column
+        import json
+        zone = json.loads(zone)
+    if not zone:
+        return None
+    try:
+        pts = [[float(p[0]), float(p[1])] for p in zone]
+    except (TypeError, ValueError, IndexError):
+        raise ValueError(f"camera {camera_id}: count_zone must be a list of [x, y] points") from None
+    if len(pts) < 3:
+        raise ValueError(f"camera {camera_id}: count_zone needs at least 3 points, got {len(pts)}")
+    if all(0.0 <= v <= 1.0 for p in pts for v in p):   # normalised -> pixels
+        pts = [[x * width, y * height] for x, y in pts]
+    return pts
 
 
 @dataclass
@@ -140,6 +163,8 @@ class PersonSettings:
     track_max_age_s: float = 2.0     # tracker: drop a track not seen for this long
     track_min_hits: int = 2          # tracker: detections needed before a person is counted
     flush_interval_s: float = 60.0   # one count row per camera per interval is appended to the DB
+    zone_anchor: str = "bottom"      # point of the box tested against count_zone: bottom (feet) | center
+    zone_min_frames: int = 2         # frames a person must stay on the new side before IN/OUT counts
 
 
 @dataclass
@@ -232,6 +257,17 @@ class MonitoringSettings:
 
 
 @dataclass
+class CameraSourceSettings:
+    """Where the camera list (and each camera's use case) comes from."""
+    source: str = "yaml"                          # yaml (config/cameras.yaml) | db (your stored procedure)
+    sql: str = "SELECT * FROM sp_get_cameras()"   # db: any query / SP call returning one row per camera
+    poll_s: float = 30.0                          # re-check the camera list this often (both sources)
+    notify_channel: str = "camera_changed"        # PostgreSQL: LISTEN here for instant reloads ("" = off)
+    defaults: Dict[str, Any] = field(default_factory=dict)   # cameras.yaml `defaults:`, applied to DB rows
+    yaml_path: Path = CONFIG_DIR / "cameras.yaml"
+
+
+@dataclass
 class Settings:
     models: ModelSettings = field(default_factory=ModelSettings)
     detection: DetectionSettings = field(default_factory=DetectionSettings)
@@ -241,6 +277,7 @@ class Settings:
     storage: StorageSettings = field(default_factory=StorageSettings)
     monitoring: MonitoringSettings = field(default_factory=MonitoringSettings)
     cameras: List[CameraConfig] = field(default_factory=list)
+    camera_source: CameraSourceSettings = field(default_factory=CameraSourceSettings)
     log_level: str = "INFO"
     logging_config: Path = CONFIG_DIR / "logging.yaml"
 
@@ -258,6 +295,13 @@ class Settings:
 
 
 # --------------------------------------------------------------------------- loaders
+def load_camera_defaults(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        return dict((yaml.safe_load(fh) or {}).get("defaults") or {})
+
+
 def load_cameras(path: Path) -> List[CameraConfig]:
     if not path.exists():
         log.warning("Camera config %s not found", path)
@@ -305,6 +349,8 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         track_max_age_s=_env("FR_PERSON_TRACK_MAX_AGE_S", 2.0),
         track_min_hits=_env("FR_PERSON_TRACK_MIN_HITS", 2),
         flush_interval_s=_env("FR_PERSON_FLUSH_S", 60.0),
+        zone_anchor=_env("FR_PERSON_ZONE_ANCHOR", "bottom"),
+        zone_min_frames=_env("FR_PERSON_ZONE_MIN_FRAMES", 2),
     )
     d = DetectionSettings(
         det_threshold=_env("FR_DET_THRESHOLD", 0.5),
@@ -374,6 +420,14 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         storage=s,
         monitoring=mon,
         cameras=load_cameras(cams_path),
+        camera_source=CameraSourceSettings(
+            source=str(_env("FR_CAMERA_SOURCE", "yaml")).lower(),
+            sql=_env("FR_CAMERA_SQL", "SELECT * FROM sp_get_cameras()"),
+            poll_s=_env("FR_CAMERA_POLL_S", 30.0),
+            notify_channel=_env("FR_CAMERA_NOTIFY_CHANNEL", "camera_changed"),
+            defaults=load_camera_defaults(cams_path),
+            yaml_path=cams_path,
+        ),
         log_level=str(_env("FR_LOG_LEVEL", "INFO")).upper(),
         logging_config=_env_path("FR_LOGGING_CONFIG", CONFIG_DIR / "logging.yaml"),
     )
@@ -390,6 +444,15 @@ def _validate(s: Settings) -> None:
         raise ValueError("FR_PERSON_CONF must be in (0, 1)")
     if s.person.flush_interval_s <= 0:
         raise ValueError("FR_PERSON_FLUSH_S must be > 0")
+    if s.camera_source.source not in ("yaml", "db"):
+        raise ValueError("FR_CAMERA_SOURCE must be yaml or db")
+    if s.camera_source.notify_channel and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}",
+                                                            s.camera_source.notify_channel):
+        raise ValueError("FR_CAMERA_NOTIFY_CHANNEL must be a plain identifier (letters, digits, _)")
+    if s.camera_source.poll_s <= 0:
+        raise ValueError("FR_CAMERA_POLL_S must be > 0")
+    if s.person.zone_anchor not in ("bottom", "center"):
+        raise ValueError("FR_PERSON_ZONE_ANCHOR must be bottom or center")
     if s.detection.batch_size < 1 or s.recognition.batch_size < 1 or s.person.batch_size < 1:
         raise ValueError("batch sizes must be >= 1")
     if s.storage.database_url and not s.storage.database_url.startswith(("postgres://", "postgresql://")):
